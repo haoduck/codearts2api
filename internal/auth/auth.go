@@ -4,6 +4,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,8 +247,13 @@ func LoadDir(dir string) ([]*Auth, error) {
 			return nil, err
 		}
 		var a Auth
+		// 单个损坏文件只告警并跳过，不阻断整个服务启动：凭据文件经历过
+		// 断电损坏（全零 NUL）时，服务宁可少一个账号也不能拒绝启动——
+		// 否则所有健康账号一起陪葬。坏文件需要重新登录该账号修复。
 		if err := json.Unmarshal(raw, &a); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", e.Name(), err)
+			log.Printf("auth: skipping corrupt file %s: %v (re-login this account)",
+				e.Name(), err)
+			continue
 		}
 		if a.CloudDragonTok == "" {
 			continue
@@ -276,7 +282,26 @@ func saveLocked(path string, v any) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// 必须先 fsync 再 rename：仅 WriteFile+Rename 时，崩溃/断电会让 NTFS
+	// 记录了文件大小元数据、数据块却从未落盘，得到一个内容全为 NUL 的
+	// 凭据文件（实测 2026-10-17：一次断电导致 6 个账号文件全部全零，
+	// 且无法恢复）。fsync 保证数据先于 rename 到达介质。
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
