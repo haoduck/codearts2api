@@ -492,6 +492,13 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 			"owned_by":       "codearts",
 			"context_length": ctx,
 		}
+		// 上游发现接口会报出高于真实上限的 max_tokens（GLM-5.2 报 131072，
+		// 但 65537 起就回 InferHub.001001005.400，实测 2026-10-16）。对外只公布
+		// 网关实际接受的上限，否则客户端照抄该值发请求必然 400——这正是
+		// 「参数无效」类报错的来源之一。
+		if maxOut > upstream.MaxTokensLimit {
+			maxOut = upstream.MaxTokensLimit
+		}
 		if maxOut > 0 {
 			entry["max_output_tokens"] = maxOut
 		}

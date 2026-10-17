@@ -488,13 +488,17 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 		body["reasoning_effort"] = opts.ReasoningEffort
 	}
 	if opts.MaxTokens != nil {
-		body["max_tokens"] = *opts.MaxTokens
+		body["max_tokens"] = ClampMaxTokens(*opts.MaxTokens)
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature
 	}
 	if opts.TopP != nil {
-		body["top_p"] = *opts.TopP
+		// 上游对 top_p=0 返回 InferHub.001001028.406 top_p cannot be zero
+		//（实测 2026-10-16），且不少客户端默认发 0，等价于「不限制」，故不传。
+		if v, ok := upstreamSafeTopP(*opts.TopP); ok {
+			body["top_p"] = v
+		}
 	}
 	if len(opts.Tools) > 0 {
 		body["tools"] = opts.Tools
@@ -503,6 +507,30 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 		}
 	}
 	return body
+}
+
+// MaxTokensLimit 上游对 max_tokens 的硬上限。
+//
+// InferHub 统一报 InferHub.001001005.400 The request param is invalid（不指出
+// 是哪个字段），跨模型一致：GLM-5.2 / glm-5.3-flash / Qwen3-VL-235B 均在
+// 65536 通过、65537 开始失败（实测 2026-10-16）。因此这里在网关侧钳制，
+// 客户端仍可按 OpenAI 语义发任意值，无需自行适配。
+const MaxTokensLimit = 65536
+
+// ClampMaxTokens 把 max_tokens 钳制到上游合法区间（≤0 不改动，交给调用方语义）。
+func ClampMaxTokens(v int) int {
+	if v > MaxTokensLimit {
+		return MaxTokensLimit
+	}
+	return v
+}
+
+// upstreamSafeTopP 过滤上游非法的 top_p=0（等价于不限制，故不传）。
+func upstreamSafeTopP(v float64) (float64, bool) {
+	if v <= 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 // chatMessagesToOpenAI 保留标准 role/tool_calls/tool 结果；只对旧调试

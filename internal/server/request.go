@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"codearts2api/internal/upstream"
 )
 
 // openAIToolCall 一次函数调用（assistant 历史或响应里用）。
@@ -92,6 +94,13 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	}
 	if req.MaxTokens != nil && *req.MaxTokens <= 0 {
 		return nil, errors.New("max_tokens must be greater than 0")
+	}
+	// 上游对 max_tokens 有 65536 硬上限，超出即回 InferHub.001001005.400
+	// The request param is invalid（实测 2026-10-16，跨模型一致）。这里提前钳制，
+	// 客户端仍可按 OpenAI 语义发任意值，不必自己适配上游限制。
+	if req.MaxTokens != nil && *req.MaxTokens > upstream.MaxTokensLimit {
+		clamped := upstream.MaxTokensLimit
+		req.MaxTokens = &clamped
 	}
 	if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 		return nil, errors.New("temperature must be between 0 and 2")

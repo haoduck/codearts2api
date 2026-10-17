@@ -4,7 +4,57 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"codearts2api/internal/upstream"
 )
+
+// 上游 max_tokens 硬上限为 65536，超出即 InferHub.001001005.400。
+// 解析层必须提前钳制，客户端无需自行适配（实测 2026-10-16）。
+func TestParseChatRequestClampsMaxTokensToUpstreamLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"max_tokens under limit", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":4096}`, 4096},
+		{"max_tokens at limit", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":65536}`, 65536},
+		{"max_tokens over limit", `{"messages":[{"role":"user","content":"hi"}],"max_tokens":131072}`, upstream.MaxTokensLimit},
+		{"max_completion_tokens over limit", `{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1000000}`, upstream.MaxTokensLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := parseChatRequest([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if req.MaxTokens == nil || *req.MaxTokens != tc.want {
+				t.Fatalf("MaxTokens=%v want %d", req.MaxTokens, tc.want)
+			}
+		})
+	}
+}
+
+// 未提供 max_tokens 时保持 nil，交给上游默认值（不得凭空写死一个上限）。
+func TestParseChatRequestLeavesMaxTokensUnset(t *testing.T) {
+	req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.MaxTokens != nil {
+		t.Fatalf("MaxTokens=%v, want nil", *req.MaxTokens)
+	}
+}
+
+// 非法值仍然必须报错，不能被钳制逻辑顺手放过。
+func TestParseChatRequestRejectsNonPositiveMaxTokens(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}`,
+		`{"messages":[{"role":"user","content":"hi"}],"max_tokens":-1}`,
+	} {
+		if _, err := parseChatRequest([]byte(body)); err == nil {
+			t.Fatalf("expected error for %s", body)
+		}
+	}
+}
 
 func TestBuildUpstreamMessagesNewChat(t *testing.T) {
 	req := &chatRequest{

@@ -65,6 +65,39 @@ func TestPickAccountPrefersAccountWithModel(t *testing.T) {
 	}
 }
 
+// 上游发现接口报出的 max_tokens 可能高于真实上限（GLM-5.2 报 131072，
+// 实际 65537 起即 InferHub.001001005.400）。对外必须公布网关实际接受的值，
+// 否则客户端照抄后每次请求都必然 400。
+func TestModelEntriesClampMaxOutputTokensToUpstreamLimit(t *testing.T) {
+	entries := modelEntries([]upstream.ModelInfo{
+		{ID: "GLM-5.2", ContextWindow: 202752, MaxTokens: 131072},
+		{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, MaxTokens: 393216, Benefit: true},
+		{ID: "small-model", ContextWindow: 32768, MaxTokens: 8192},
+	})
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		got, ok := e["max_output_tokens"].(int64)
+		if !ok {
+			continue // 静态兜底条目不公布该字段
+		}
+		if got > upstream.MaxTokensLimit {
+			t.Fatalf("%s 公布了超过上游上限的 max_output_tokens=%d（上限 %d）",
+				id, got, upstream.MaxTokensLimit)
+		}
+	}
+	byID := map[string]map[string]any{}
+	for _, e := range entries {
+		byID[e["id"].(string)] = e
+	}
+	if byID["GLM-5.2"]["max_output_tokens"] != int64(upstream.MaxTokensLimit) {
+		t.Fatalf("GLM-5.2 应钳到上限，got=%v", byID["GLM-5.2"]["max_output_tokens"])
+	}
+	// 低于上限的真实值必须原样保留，不能被抬到上限。
+	if byID["small-model"]["max_output_tokens"] != int64(8192) {
+		t.Fatalf("低上限模型应保持原值，got=%v", byID["small-model"]["max_output_tokens"])
+	}
+}
+
 func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 	entries := modelEntries([]upstream.ModelInfo{
 		{ID: "GLM-5.2", ContextWindow: 202752, MaxTokens: 8192},
