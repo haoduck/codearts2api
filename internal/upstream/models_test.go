@@ -13,6 +13,57 @@ import (
 	"codearts2api/internal/auth"
 )
 
+func TestRemapToBuiltinIDsUsesRealModelID(t *testing.T) {
+	// builtin 的 model_id 是权威值；agent-center 的 model_name 只是展示名。
+	builtin := []ModelInfo{
+		{ID: "GLM-5.2", Name: "GLM-5.2", ContextWindow: 1048576},
+		{ID: "openpangu-2.0-flash", Name: "OpenPangu-2.0-Flash", ContextWindow: 524288},
+		{ID: "glm-5.2-sft-harmony", Name: "GLM-5.2-ArkTS-SPARK", ContextWindow: 131072},
+		{ID: "glm-5.3", Name: "GLM-5.3", ContextWindow: 1048576},
+	}
+	agent := []ModelInfo{
+		{ID: "OpenPangu-2.0-Flash", ContextWindow: 524288},
+		{ID: "GLM-5.2-ArkTS-SPARK", ContextWindow: 131072},
+		{ID: "GLM-5.3", ContextWindow: 1048576},
+		{ID: "GLM-5.2", ContextWindow: 202752},
+	}
+	got := remapToBuiltinIDs(agent, builtin)
+	want := []string{"openpangu-2.0-flash", "glm-5.2-sft-harmony", "glm-5.3", "GLM-5.2"}
+	for i := range want {
+		if got[i].ID != want[i] {
+			t.Errorf("remap[%d] = %q, want %q", i, got[i].ID, want[i])
+		}
+	}
+
+	// 合并后不得再出现展示名 ID（上游会返回 002002009.404）。
+	merged := MergeModels(got, builtin)
+	for _, mi := range merged {
+		for _, bad := range []string{"GLM-5.2-ArkTS-SPARK", "OpenPangu-2.0-Flash"} {
+			if mi.ID == bad {
+				t.Errorf("展示名 %q 不应作为模型 ID 出现", bad)
+			}
+		}
+	}
+	// 同一个模型只留一条（大小写归一后去重）。
+	seen := map[string]int{}
+	for _, mi := range merged {
+		seen[strings.ToLower(mi.ID)]++
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("模型 %q 出现 %d 次，应去重", id, n)
+		}
+	}
+}
+
+func TestRemapToBuiltinIDsNoBuiltinKeepsAgent(t *testing.T) {
+	agent := []ModelInfo{{ID: "OpenPangu-2.0-Flash"}}
+	got := remapToBuiltinIDs(agent, nil)
+	if len(got) != 1 || got[0].ID != "OpenPangu-2.0-Flash" {
+		t.Fatalf("builtin 不可用时不应改写 agent 结果，got=%v", got)
+	}
+}
+
 func TestCanonicalModelKnownIndex(t *testing.T) {
 	SetAccountModels("t-canon", []ModelInfo{{ID: "Qwen3.9-Test-VL", ContextWindow: 4096}})
 	tests := []struct{ in, want string }{

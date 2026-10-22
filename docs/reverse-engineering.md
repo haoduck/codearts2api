@@ -152,17 +152,26 @@ Body：
 - 内置补充接口：`GET {snap}/v1/model/builtin`（`Agent-Type: PromptCenter`）→ `{builtinModels:[...]}`。
 - 模型 ID 区分大小写；福利网关返回小写，`CanonicalModel` 做大小写不敏感归一。
 
-> **2026-10-22 上游变更（实测）**：福利网关已关闭。
+> **2026-10-22/23 上游变更（实测）**：福利网关已关闭。
 > `GET {snap}/v1/benefit-gateway-config` → `{"enabled":false,...}`；
 > opengw 的 `gateway/config`、`benefit/claim`、`user/tokens/balance` 一律返回
 > `{"error_code":"4000","error_msg":"invalid channel, group not found"}`（HTTP 200）。
 > 旧的三个福利模型 `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` /
 > `glm-5.3-flash` 已停发（`InferHub.4004.200 benefit not found`）。
-> builtin 列表新增 `DeepSeek-V4.1-Flash`、`GLM-5.3`（描述带【限时体验】）：
-> 不带 `maas_type: benefit` 报 `InferHub.002002009.404`，带上则报 `4004.200`，
-> 即它们走福利路由但当前账号未获授予——福利网关恢复前无法使用。
-> 实测仍可用的模型：`GLM-5.2`、`glm-5.2-sft-harmony`、`Qwen3-VL-235B`、
-> `kimi-k2.6-vl`（`snap-chat` 是 `GLM-5.2` 的旧别名）。
+>
+> **模型 ID 大小写敏感，且 agent-center 给的是展示名**：
+> `GET /v1/model/builtin` 的 `model_id` 才是权威值（`openpangu-2.0-flash`、
+> `glm-5.2-sft-harmony`、`glm-5.3`、`deepseek-v4.1-flash`、`kimi-k3`，全小写；
+> `GLM-5.2`、`Qwen3-VL-235B` 保持大写/混合）；而
+> `GET /v1/agent-center/agents/detail` 的 `model_id` 为空，真实 ID 在
+> `model_parameters.model_id` / `model_alias`，`model_name` 只是展示名
+> （`GLM-5.2-ArkTS-SPARK` 就是 `glm-5.2-sft-harmony` 的展示名）。
+> 用展示名或错误大小写请求 → `InferHub.002002009.404`。
+> 三个【限时体验】模型按积分计费，**不能**带 `maas_type: benefit`（带了 `4004.200`）。
+>
+> 当前实测可用 9 个模型：`GLM-5.2`、`glm-5.2-sft-harmony`、`Qwen3-VL-235B`、
+> `kimi-k2.6-vl`、`openpangu-2.0-flash`、`openpangu-2.0-pro`、`glm-5.3`、
+> `deepseek-v4.1-flash`、`kimi-k3`（`snap-chat` 是 `GLM-5.2` 的旧别名）。
 
 ### 本仓库的实现取舍
 

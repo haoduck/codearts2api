@@ -66,23 +66,29 @@ type staticModel struct {
 // staticModels 静态兜底表：**只放实测确认可用的模型**。
 //
 // 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
-// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-10-22 真实账号
-// 逐个调用验证（见 docs/reverse-engineering.md §7）：
+// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-10-22/23
+// 真实账号逐个调用验证（见 docs/reverse-engineering.md §7）：
 //
 //	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B、kimi-k2.6-vl
-//	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
-//	❌ deepseek-v4-flash-0731、deepseek-v4-pro-0813、glm-5.3-flash（4004.200）
+//	✅ openpangu-2.0-flash、openpangu-2.0-pro、glm-5.3、deepseek-v4.1-flash、kimi-k3
+//	   （后 5 个必须用小写 ID；【限时体验】按积分计费，**不能**带 maas_type: benefit）
+//	❌ deepseek-v4-flash-0731、deepseek-v4-pro-0813、glm-5.3-flash（4004.200，已停发）
 //
 // 限时福利模型不再进静态表：2026-10-22 实测上游已关闭福利网关
 // （GET {snap}/v1/benefit-gateway-config → enabled:false；opengw 的
 // gateway/config、benefit/claim、tokens/balance 一律 error_code=4000
-// "invalid channel, group not found"），旧的三个福利模型已停发。福利网关恢复后
-// 模型发现会把它们重新带回来——发现结果优先于静态表，不需要在这里补。
+// "invalid channel, group not found"）。福利网关恢复后模型发现会把它们重新带回来
+// ——发现结果优先于静态表，不需要在这里补。
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
 	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
 	{ID: "kimi-k2.6-vl", ContextWindow: 131072},
+	{ID: "openpangu-2.0-flash", ContextWindow: 524288},
+	{ID: "openpangu-2.0-pro", ContextWindow: 524288},
+	{ID: "glm-5.3", ContextWindow: 1048576},
+	{ID: "deepseek-v4.1-flash", ContextWindow: 1048576},
+	{ID: "kimi-k3", ContextWindow: 1048576},
 }
 
 const (

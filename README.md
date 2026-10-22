@@ -89,15 +89,18 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 
 关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
 
-> **2026-10-22 上游变更（实测）**：福利网关已关闭——`/v1/benefit-gateway-config`
+> **2026-10-22/23 上游变更（实测）**：福利网关已关闭——`/v1/benefit-gateway-config`
 > 返回 `enabled: false`，福利接口（`gateway/config`、`benefit/claim`、`tokens/balance`）
 > 一律返回 `error_code=4000 invalid channel, group not found`。旧的
-> `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` / `glm-5.3-flash` 已停发
-> （`4004.200`）；builtin 新列出的 `DeepSeek-V4.1-Flash`、`GLM-5.3`（【限时体验】）
-> 同样走福利路由但未获授予，调用返回 `4004.200 benefit not found`。
-> 当前实测可用：`GLM-5.2`、`glm-5.2-sft-harmony`、`Qwen3-VL-235B`、`kimi-k2.6-vl`
-> （`snap-chat` 是 `GLM-5.2` 的旧别名）。静态兜底表已按此更新；福利网关恢复后
-> 由模型发现自动带回福利模型，无需改代码。完整排查记录与压测数据见
+> `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` / `glm-5.3-flash` 已停发（`4004.200`）。
+> builtin 新增的 `glm-5.3`、`deepseek-v4.1-flash`、`kimi-k3`（【限时体验】，按积分计费）
+> 以及 `openpangu-2.0-flash` / `openpangu-2.0-pro` 都能正常调用，但**模型 ID 大小写敏感**：
+> 必须用小写 ID，且**不能**带 `maas_type: benefit`（带了会 `4004.200`）；
+> `GLM-5.2`、`Qwen3-VL-235B` 则必须保持原有大小写。
+> 当前实测可用 9 个模型：`GLM-5.2`、`glm-5.2-sft-harmony`（展示名 GLM-5.2-ArkTS-SPARK）、
+> `Qwen3-VL-235B`、`kimi-k2.6-vl`、`openpangu-2.0-flash`、`openpangu-2.0-pro`、
+> `glm-5.3`、`deepseek-v4.1-flash`、`kimi-k3`（`snap-chat` 是 `GLM-5.2` 的旧别名）。
+> 完整排查记录与压测数据见
 > [`docs/2026-10-22-upstream-models-and-concurrency.md`](docs/2026-10-22-upstream-models-and-concurrency.md)。
 
 ### 模型可用性探测

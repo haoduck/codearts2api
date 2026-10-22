@@ -55,10 +55,17 @@ var seedBenefitModels = []string{
 }
 
 // 内置模型种子（大小写归一用，不标记福利）。
+//
+// 上游模型 ID 大小写敏感：GLM-5.2 / Qwen3-VL-235B 是大写或混合大小写，
+// 而 openpangu-2.0-flash、glm-5.3、kimi-k3、deepseek-v4.1-flash 等必须全小写。
+// 这里只放真实 model_id，**不要**放展示名（GLM-5.2-ArkTS-SPARK 是
+// glm-5.2-sft-harmony 的展示名，用它会 002002009.404）。发现结果会覆盖本表。
 var seedKnownModels = []string{
-	"GLM-5.2", "GLM-5.2-ArkTS-SPARK", "GLM-5.1", "GLM-4.7",
-	"OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash",
+	"GLM-5.2", "GLM-5.1", "GLM-4.7",
 	"Qwen3-VL-235B", "Qwen3.5-397B-A17B-VL", "Qwen3.6-27B-VL",
+	"openpangu-2.0-pro", "openpangu-2.0-flash",
+	"kimi-k2.6-vl", "kimi-k3", "glm-5.2-sft-harmony",
+	"glm-5.3", "deepseek-v4.1-flash",
 }
 
 var seedBenefit = func() map[string]bool {
@@ -138,9 +145,10 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 			ac.benefit[key] = true
 			ac.lastBenefit[key] = mi
 		}
-		if _, ok := catalog.known[key]; !ok || mi.ID != key {
-			catalog.known[key] = mi.ID
-		}
+		// 发现结果权威：覆盖冷启动种子/旧映射。上游模型 ID 大小写敏感
+		// （openpangu-2.0-flash 必须小写、GLM-5.2 必须大写），种子猜错时
+		// 不能因为「映射已存在」就保留错误的大小写。
+		catalog.known[key] = mi.ID
 	}
 	if keepBenefit {
 		// 本轮内置来源没有提到的福利模型：继续按福利路由（宁可多带，不可漏带）。
@@ -151,9 +159,7 @@ func setAccountModels(accountID string, infos []ModelInfo, keepBenefit bool) {
 			ac.benefit[key] = true
 			ac.knows[key] = true
 			ac.infos = append(ac.infos, mi)
-			if _, ok := catalog.known[key]; !ok || mi.ID != key {
-				catalog.known[key] = mi.ID
-			}
+			catalog.known[key] = mi.ID
 		}
 		sort.Slice(ac.infos, func(i, j int) bool {
 			li, lj := strings.ToLower(ac.infos[i].ID), strings.ToLower(ac.infos[j].ID)
@@ -299,18 +305,28 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 		SecurityToken:   acct.CloudDragonTok,
 	}
 	accountID := acct.UserID
-	var sets [][]ModelInfo
+	var agentInfos, builtinInfos []ModelInfo
 	if infos, err := c.fetchAgentModels(cred); err != nil {
 		Log("agent models: %v", err)
 	} else {
-		sets = append(sets, infos)
+		agentInfos = infos
 	}
 	builtinOK := false
 	if infos, err := c.fetchBuiltinModels(accountID, cred); err != nil {
 		Log("builtin models: %v", err)
 	} else {
 		builtinOK = true
-		sets = append(sets, infos)
+		builtinInfos = infos
+	}
+	// 兜底：agent-center 仍可能把展示名塞进 ID 字段，用 builtin 的
+	// 「显示名 → 真实 model_id」映射纠正（builtin 的 model_id 是权威值）。
+	agentInfos = remapToBuiltinIDs(agentInfos, builtinInfos)
+	var sets [][]ModelInfo
+	if len(agentInfos) > 0 {
+		sets = append(sets, agentInfos)
+	}
+	if len(builtinInfos) > 0 {
+		sets = append(sets, builtinInfos)
 	}
 	benefitOK := false
 	if infos, err := c.fetchBenefitModels(accountID, cred); err != nil {
@@ -326,6 +342,36 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	// 福利来源失败但内置来源成功：保留上一轮已确认的福利条目，别把标记弄丢。
 	setAccountModels(accountID, out, builtinOK && !benefitOK)
 	return out, nil
+}
+
+// remapToBuiltinIDs 把「用展示名当 ID」的条目替换成 builtin 的真实 model_id。
+//
+// builtin 的 model_id 是权威值（GLM-5.2 / openpangu-2.0-flash / glm-5.3），
+// agent-center 的 model_name 是展示名（GLM-5.2-ArkTS-SPARK / OpenPangu-2.0-Flash）。
+// 上游聊天接口对模型 ID 大小写敏感，用展示名会返回 InferHub.002002009.404
+// 「The model is not registered」——实测 2026-10-23。
+func remapToBuiltinIDs(agent, builtin []ModelInfo) []ModelInfo {
+	if len(agent) == 0 || len(builtin) == 0 {
+		return agent
+	}
+	byName := make(map[string]string, len(builtin)*2)
+	for _, mi := range builtin {
+		if mi.ID == "" {
+			continue
+		}
+		byName[strings.ToLower(mi.ID)] = mi.ID
+		if mi.Name != "" {
+			byName[strings.ToLower(mi.Name)] = mi.ID
+		}
+	}
+	out := make([]ModelInfo, 0, len(agent))
+	for _, mi := range agent {
+		if real, ok := byName[strings.ToLower(mi.ID)]; ok && real != mi.ID {
+			mi.ID = real
+		}
+		out = append(out, mi)
+	}
+	return out
 }
 
 // fetchAgentModels 官方 fetchAgentModels 等价实现：agent-center detail 的 gpts.models。
@@ -361,13 +407,17 @@ func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
 	}
 	out := make([]ModelInfo, 0, len(detail.Gpts.Models))
 	for _, m := range detail.Gpts.Models {
-		id := firstNonEmpty(m.ModelName, m.ModelID, m.ModelAlias, m.Params.ModelID)
+		// model_name 只是展示名（GLM-5.2-ArkTS-SPARK / OpenPangu-2.0-Flash），
+		// 上游聊天接口只认 model_parameters.model_id（或 model_alias）里的真实 ID：
+		// glm-5.2-sft-harmony / openpangu-2.0-flash / glm-5.3 / kimi-k3 ...
+		// 用展示名当 ID 会报 InferHub.002002009.404「未注册」——实测 2026-10-23。
+		id := firstNonEmpty(m.Params.ModelID, m.ModelID, m.ModelAlias, m.ModelName)
 		if id == "" {
 			continue
 		}
 		out = append(out, ModelInfo{
 			ID:            id,
-			Name:          id,
+			Name:          firstNonEmpty(m.ModelName, id),
 			ContextWindow: m.Params.ContextWindow,
 			MaxTokens:     m.Params.MaxTokens,
 			Desc:          m.Params.ModelDesc,

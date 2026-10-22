@@ -39,31 +39,78 @@ GET  {opengw}/api/v1/user/tokens/balance   → 200 {"error_code":"4000", ...同�
 
 即它们确实是福利路由模型，但当前账号未获授权；福利网关恢复前无法使用，本地代码无法绕过。
 
-### 2.3 逐模型实测（真实账号，2026-10-22）
+### 2.3 逐模型实测（真实账号，2026-10-22/23）
 
-| 模型 | 结果 |
+修正 ID 大小写后（见 §2.4），当前账号 **9 个模型全部可用**：
+
+| 模型 ID（必须按此大小写） | 说明 | 结果 |
+|---|---|---|
+| `GLM-5.2` | 旗舰模型（`glm-5.2`、`snap-chat` 是别名） | ✅ 200 |
+| `glm-5.2-sft-harmony` | 展示名是 **GLM-5.2-ArkTS-SPARK** | ✅ 200 |
+| `Qwen3-VL-235B` | 多模态（`qwen3-vl-235b` 是别名） | ✅ 200 |
+| `kimi-k2.6-vl` | 编程 | ✅ 200 |
+| `openpangu-2.0-flash` | 小写 ID | ✅ 200 |
+| `openpangu-2.0-pro` | 小写 ID | ✅ 200 |
+| `glm-5.3` | 【限时体验】，积分计费 | ✅ 200 |
+| `deepseek-v4.1-flash` | 【限时体验】，积分计费 | ✅ 200 |
+| `kimi-k3` | 【限时体验】，积分计费 | ✅ 200 |
+| `deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`glm-5.3-flash` | 已停发 | ❌ `4004.200` |
+
+### 2.4 根因：agent-center 把「展示名」当模型 ID（2026-10-23 实测）
+
+上游两个模型来源的字段含义不同：
+
+```text
+GET /v1/model/builtin              （权威）
+  model_id="openpangu-2.0-flash"   model_name="OpenPangu-2.0-Flash"
+  model_id="glm-5.2-sft-harmony"   model_name="GLM-5.2-ArkTS-SPARK"
+
+GET /v1/agent-center/agents/detail
+  model_id=""                      model_name="OpenPangu-2.0-Flash"
+  model_parameters.model_id="openpangu-2.0-flash"
+  model_alias="openpangu-2.0-flash"
+```
+
+`fetchAgentModels` 原来用 `firstNonEmpty(model_name, model_id, model_alias, ...)`，于是把
+**展示名**当成了模型 ID。上游聊天接口对模型 ID **大小写敏感**：
+
+| 请求 model | 结果 |
 |---|---|
-| `GLM-5.2` / `glm-5.2` / `snap-chat`（旧别名） | ✅ 200 |
-| `glm-5.2-sft-harmony` | ✅ 200 |
-| `Qwen3-VL-235B` / `qwen3-vl-235b` | ✅ 200 |
-| `kimi-k2.6-vl` | ✅ 200 |
-| `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Flash/Pro`、`Kimi-K3` | ❌ `002002009.404` 未注册 |
-| `DeepSeek-V4.1-Flash`、`GLM-5.3` | ❌ `4004.200` 未授予 |
-| `deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`glm-5.3-flash` | ❌ `4004.200` 已停发 |
+| `openpangu-2.0-flash` / `openpangu-2.0-pro` | ✅ 流式正常 |
+| `OpenPangu-2.0-Flash` / `OpenPangu-2.0-Pro` | ❌ `InferHub.002002009.404 not registered` |
+| `glm-5.3` / `deepseek-v4.1-flash` / `kimi-k3` | ✅ |
+| `GLM-5.3` / `DeepSeek-V4.1-Flash` / `Kimi-K3` | ❌ `002002009.404` |
+| `GLM-5.2` / `Qwen3-VL-235B`（大写/混合） | ✅（改成全小写反而 ❌） |
+| `GLM-5.2-ArkTS-SPARK` | ❌（它只是 `glm-5.2-sft-harmony` 的展示名） |
+
+另外三个【限时体验】模型是**按积分计费**的普通模型，**不能**带 `maas_type: benefit`
+（带上会返回 `InferHub.4004.200 benefit not found`，不带则正常流式）。
+
+> 这也解释了此前把它们判成「未注册/未授予」的误判：请求发出去的是展示名。
 
 OpenAI 兼容层本身正常：流式（含 `stream_options.include_usage` 的 usage chunk 与 `[DONE]`）、
 工具调用（`tools` + `tool_choice: auto/required/指定函数`）、小写别名归一均实测通过。
 
 ## 3. 代码改动
 
-### 3.1 模型目录（`internal/server/handler.go`）
+### 3.1 模型目录与 ID 归一（`internal/upstream/models.go` + `internal/server/handler.go`）
 
-`staticModels` 是 `/v1/models` 在动态发现失败时的兜底表，必须只放**实测确认可用**的模型：
+- **`fetchAgentModels` 优先取真实 ID**：`model_parameters.model_id` → `model_id` →
+  `model_alias` → `model_name`，`Name` 保留展示名。此前优先取 `model_name`，
+  导致把展示名当 ID 发给上游。
+- **新增 `remapToBuiltinIDs`**：用 builtin 的「显示名 → 真实 `model_id`」映射兜底，
+  防止 agent-center 再塞展示名。
+- **`setAccountModels` 改为「发现结果权威」**：无条件覆盖 `catalog.known` 里的映射。
+  原来只在「映射不存在」时写入，冷启动种子猜错大小写后会被永久固化。
+- **`seedKnownModels` 清理**：删掉展示名 `GLM-5.2-ArkTS-SPARK`，`openpangu-2.0-*`
+  改小写，补上 `kimi-k3` / `glm-5.3` / `deepseek-v4.1-flash` / `glm-5.2-sft-harmony`。
+- **`staticModels` 兜底表**（`internal/server/handler.go`）：只放实测可用的模型，
+  删除已停发的 3 个福利模型，补入 `kimi-k2.6-vl`、`openpangu-2.0-flash`、
+  `openpangu-2.0-pro`、`glm-5.3`、`deepseek-v4.1-flash`、`kimi-k3`。
+  福利模型不写进静态表：福利网关恢复后由模型发现自动带回（发现结果优先于静态表）。
 
-- 删除已停发的 `deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`glm-5.3-flash`
-  （它们会从静态表补位，导致客户端选中就 404）。
-- 新增实测可用的 `kimi-k2.6-vl`。
-- 福利模型不再写进静态表：福利网关恢复后由模型发现自动带回（发现结果优先于静态表）。
+效果：`/v1/models` 现在输出 9 个真实 ID（不再出现 `GLM-5.2-ArkTS-SPARK`、
+`OpenPangu-2.0-Flash` 这类展示名），且用展示名大小写发起聊天也会被归一后正常返回。
 
 ### 3.2 重新登录后自动解禁（`internal/pool/pool.go`）
 
