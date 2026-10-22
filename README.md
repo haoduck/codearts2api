@@ -89,6 +89,17 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 
 关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
 
+> **2026-10-22 上游变更（实测）**：福利网关已关闭——`/v1/benefit-gateway-config`
+> 返回 `enabled: false`，福利接口（`gateway/config`、`benefit/claim`、`tokens/balance`）
+> 一律返回 `error_code=4000 invalid channel, group not found`。旧的
+> `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` / `glm-5.3-flash` 已停发
+> （`4004.200`）；builtin 新列出的 `DeepSeek-V4.1-Flash`、`GLM-5.3`（【限时体验】）
+> 同样走福利路由但未获授予，调用返回 `4004.200 benefit not found`。
+> 当前实测可用：`GLM-5.2`、`glm-5.2-sft-harmony`、`Qwen3-VL-235B`、`kimi-k2.6-vl`
+> （`snap-chat` 是 `GLM-5.2` 的旧别名）。静态兜底表已按此更新；福利网关恢复后
+> 由模型发现自动带回福利模型，无需改代码。完整排查记录与压测数据见
+> [`docs/2026-10-22-upstream-models-and-concurrency.md`](docs/2026-10-22-upstream-models-and-concurrency.md)。
+
 ### 模型可用性探测
 
 `/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
@@ -148,6 +159,31 @@ mkdir -p auths data
 docker compose up -d --build
 ```
 
+国内网络拉不到 `docker.io` 时（报 `auth.docker.io ... connectex: A connection attempt failed`
+或 `failed to fetch anonymous token`），任选一种方式：
+
+```bash
+# 方式一：给 Docker 配置镜像加速，编辑 ~/.docker/daemon.json 后重启 Docker
+{
+  "registry-mirrors": ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
+}
+
+# 方式二：只对本项目换基础镜像源（不改 Docker 全局配置）
+export CA2A_GO_IMAGE=docker.m.daocloud.io/library/golang:1.24-alpine
+export CA2A_RUNTIME_IMAGE=docker.m.daocloud.io/library/alpine:3.20
+export CA2A_APK_MIRROR=https://mirrors.aliyun.com   # 可选，替换 apk 源
+docker compose up -d --build
+```
+
+也可以先用镜像站拉取再打官方 tag，之后构建直接用本地镜像：
+
+```bash
+docker pull docker.m.daocloud.io/library/golang:1.24-alpine
+docker tag  docker.m.daocloud.io/library/golang:1.24-alpine golang:1.24-alpine
+docker pull docker.m.daocloud.io/library/alpine:3.20
+docker tag  docker.m.daocloud.io/library/alpine:3.20 alpine:3.20
+```
+
 ## 环境变量配置
 
 除了 `config.json`，还支持以下环境变量覆盖：
@@ -164,7 +200,7 @@ docker compose up -d --build
 | `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
 | `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `5` |
+| `CA2A_MAX_CONCURRENT` | 单账号最大并发数（上游单账号只有 3 个并发会话且释放慢，建议 2~3；设 1 时一个请求排队会阻塞整号） | `1` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |

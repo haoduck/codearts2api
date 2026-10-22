@@ -1,6 +1,12 @@
 services:
   codearts2api:
-    build: .
+    build:
+      context: .
+      args:
+        # 国内网络可用 .env 覆盖，例如 CA2A_GO_IMAGE=docker.m.daocloud.io/library/golang:1.24-alpine
+        GO_IMAGE: ${CA2A_GO_IMAGE:-golang:1.24-alpine}
+        RUNTIME_IMAGE: ${CA2A_RUNTIME_IMAGE:-alpine:3.20}
+        APK_MIRROR: ${CA2A_APK_MIRROR:-}
     container_name: codearts2api
     restart: unless-stopped
     ports:

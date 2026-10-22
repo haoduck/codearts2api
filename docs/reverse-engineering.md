@@ -152,6 +152,18 @@ Body：
 - 内置补充接口：`GET {snap}/v1/model/builtin`（`Agent-Type: PromptCenter`）→ `{builtinModels:[...]}`。
 - 模型 ID 区分大小写；福利网关返回小写，`CanonicalModel` 做大小写不敏感归一。
 
+> **2026-10-22 上游变更（实测）**：福利网关已关闭。
+> `GET {snap}/v1/benefit-gateway-config` → `{"enabled":false,...}`；
+> opengw 的 `gateway/config`、`benefit/claim`、`user/tokens/balance` 一律返回
+> `{"error_code":"4000","error_msg":"invalid channel, group not found"}`（HTTP 200）。
+> 旧的三个福利模型 `deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` /
+> `glm-5.3-flash` 已停发（`InferHub.4004.200 benefit not found`）。
+> builtin 列表新增 `DeepSeek-V4.1-Flash`、`GLM-5.3`（描述带【限时体验】）：
+> 不带 `maas_type: benefit` 报 `InferHub.002002009.404`，带上则报 `4004.200`，
+> 即它们走福利路由但当前账号未获授予——福利网关恢复前无法使用。
+> 实测仍可用的模型：`GLM-5.2`、`glm-5.2-sft-harmony`、`Qwen3-VL-235B`、
+> `kimi-k2.6-vl`（`snap-chat` 是 `GLM-5.2` 的旧别名）。
+
 ### 本仓库的实现取舍
 
 - **福利目录按账号存放**（`internal/upstream/models.go`）：福利是按账号授予的，

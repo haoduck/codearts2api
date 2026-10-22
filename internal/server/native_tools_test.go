@@ -252,7 +252,7 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 			}
 		}
 	}
-	want := map[string]int{"deepseek-v4-pro-0813": 1048576, "GLM-5.2": 202752}
+	want := map[string]int{"kimi-k2.6-vl": 131072, "GLM-5.2": 202752}
 	for _, model := range payload.Data {
 		if expected, ok := want[model.ID]; ok {
 			if model.ContextLength != expected {

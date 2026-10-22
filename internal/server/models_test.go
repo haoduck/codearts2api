@@ -128,8 +128,8 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 		t.Error("福利模型应在 /v1/models 标记 benefit")
 	}
 
-	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），福利标记跟随静态表。
-	for _, want := range []string{"Qwen3-VL-235B", "qwen3-vl-235b", "glm-5.3-flash", "deepseek-v4-flash-0731"} {
+	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名）。
+	for _, want := range []string{"Qwen3-VL-235B", "qwen3-vl-235b", "kimi-k2.6-vl"} {
 		if byID[want] == nil {
 			t.Errorf("静态兜底缺少 %q", want)
 		}
@@ -137,8 +137,11 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 	if byID["qwen3-vl-235b"]["benefit"] != nil {
 		t.Error("内置模型不应标记 benefit")
 	}
-	if byID["glm-5.3-flash"]["benefit"] != true {
-		t.Error("静态兜底里的福利模型应保留 benefit 标记")
+	// 2026-10-22 上游关闭福利网关，已停发的福利模型不再由静态表补位。
+	for _, dead := range []string{"glm-5.3-flash", "deepseek-v4-flash-0731"} {
+		if byID[dead] != nil {
+			t.Errorf("已停发的福利模型 %q 不应出现在 /v1/models", dead)
+		}
 	}
 
 	// 动态目录整体失败（无账号可用）时仍返回完整静态表 + 别名。

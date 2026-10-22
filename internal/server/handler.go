@@ -66,19 +66,23 @@ type staticModel struct {
 // staticModels 静态兜底表：**只放实测确认可用的模型**。
 //
 // 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
-// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
+// 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-10-22 真实账号
 // 逐个调用验证（见 docs/reverse-engineering.md §7）：
 //
-//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
+//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B、kimi-k2.6-vl
 //	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
+//	❌ deepseek-v4-flash-0731、deepseek-v4-pro-0813、glm-5.3-flash（4004.200）
+//
+// 限时福利模型不再进静态表：2026-10-22 实测上游已关闭福利网关
+// （GET {snap}/v1/benefit-gateway-config → enabled:false；opengw 的
+// gateway/config、benefit/claim、tokens/balance 一律 error_code=4000
+// "invalid channel, group not found"），旧的三个福利模型已停发。福利网关恢复后
+// 模型发现会把它们重新带回来——发现结果优先于静态表，不需要在这里补。
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
 	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
-	// 限时福利（需领取；领取后实测可用，聊天自动带 maas_type: benefit）
-	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
-	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
-	{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
+	{ID: "kimi-k2.6-vl", ContextWindow: 131072},
 }
 
 const (
@@ -617,6 +621,31 @@ func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.A
 	return nil
 }
 
+// acquireSlot 找一个能服务该模型、且还有空闲并发槽位的健康账号并加锁。
+//
+// 与 pickAccount 的区别：这里会跳过槽位已满的账号，而不是在单个账号上阻塞等待。
+// 否则一波并发请求会全部排在同一个账号上（PickExcluding 总是返回第一个健康账号），
+// 撞上游 TM.00001041「并发会话数已达上限」后每条请求还要空转重试，延迟飙到分钟级。
+// 返回 nil 表示所有账号要么不健康、要么槽位都满了。
+func (h *Handler) acquireSlot(skip map[string]bool, model string) *pool.Account {
+	want := strings.ToLower(upstream.CanonicalModel(model))
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if acct == nil || skip[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
+			continue
+		}
+		if !h.accountCanServe(acct, model) {
+			continue
+		}
+		if st, _ := modelAvailability(acct.UID, want); st == availUnusable {
+			continue
+		}
+		if h.cfg.Pool.AcquireLock(acct.Name) {
+			return acct
+		}
+	}
+	return nil
+}
+
 // discoverMissingCatalogs 为「目录未知或已过期」的健康账号补一次模型发现。
 //
 // 只在聊天挑号失败时调用（不是热路径），且有 CatalogTTL 与失败退避兜底：
@@ -722,29 +751,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		var acct *pool.Account
 		if stickyAcct != "" {
-			// 续接会话：锁定原账号（若仍健康）。
-			acct = h.cfg.Pool.Get(stickyAcct)
-			if acct == nil || !h.cfg.Pool.Healthy(stickyAcct) {
-				stickyAcct = ""
-				acct = h.cfg.Pool.PickExcluding(tried)
+			// 续接会话：锁定原账号（若仍健康且还有空闲槽位）。
+			if cand := h.cfg.Pool.Get(stickyAcct); cand != nil && h.cfg.Pool.Healthy(stickyAcct) && h.cfg.Pool.AcquireLock(stickyAcct) {
+				acct = cand
 			} else {
-				tried[acct.Name] = true
+				stickyAcct = ""
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			// 优先挑还有空闲槽位的账号：并发请求要分散到不同账号，
+			// 不能全堆在池子里的第一个账号上（那样必然撞上游并发上限）。
+			acct = h.acquireSlot(tried, model)
 		}
 		if acct == nil {
-			break
+			// 所有账号槽位都满：等任意一个账号释放槽位。池子满载时的正确排队
+			// 方式——不能钉在某个账号上反复超时，否则会把换号预算耗光后 503。
+			acct = h.cfg.Pool.AcquireAnyLockWait(30*time.Second, tried)
+			if acct == nil {
+				break
+			}
 		}
 		tried[acct.Name] = true
-
-		// 阻塞等待并发槽位（上游单账号并发会话释放慢，串行最稳）。
-		// 超时 180s 排队（5 个请求 × ~30s 上限），避免高并发立即失败跳号。
-		if !h.cfg.Pool.AcquireLockWait(acct.Name, 180*time.Second) {
-			log.Printf("account %s concurrent limit reached after wait, trying next", acct.Name)
-			continue
-		}
 
 		ok, verr := h.cfg.Pool.Validate(acct)
 		if verr == nil && !ok {
@@ -789,6 +816,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
+		holding := true // 是否仍持有 acct 的并发槽位
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
@@ -814,9 +842,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
+				// 上游排队是「整个账号的会话槽位」满了，换号没用：别的账号的
+				// 本地槽位可能空着，但上游会话同样没释放。原地等上游释放
+				// （实测十几秒），比自己空转或反复换号都快。
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				// 释放锁让其他请求有机会，等待后重新获取
 				h.cfg.Pool.ReleaseLock(acct.Name)
+				holding = false
 				select {
 				case <-time.After(h.cfg.QueueRetryDelay):
 				case <-r.Context().Done():
@@ -827,12 +859,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					lastErr = errors.New("concurrent limit: could not reacquire lock after wait")
 					break
 				}
+				holding = true
 				continue
 			}
 			break // 非并发错误，跳出重试
 		}
 		if serr != nil {
-			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			if holding {
+				h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			}
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.

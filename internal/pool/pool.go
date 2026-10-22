@@ -275,9 +275,20 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		byUID[a.UID] = a
 	}
 	next := make([]*Account, 0, len(auths))
+	reEnabled := 0
 	for _, a := range auths {
 		if existing, ok := byUID[a.UserID]; ok {
 			existing.mu.Lock()
+			// 重新登录会写回更新的凭证文件（updated_at 变新）：此时必须解除
+			// 「refresh_token 终态失效」的禁用，否则用户重新登录后账号仍是
+			// disabled，面板上看起来像登录没生效（只能手动 enable 或删 state）。
+			if existing.disabled && existing.Auth != nil && a.UpdatedAt > existing.Auth.UpdatedAt {
+				existing.disabled = false
+				existing.disabledReason = ""
+				existing.lastErr = ""
+				reEnabled++
+				log.Printf("pool re-enable account=%s reason=credentials updated (re-login)", a.UserID)
+			}
 			existing.Auth = a
 			existing.UserName = a.UserName
 			existing.maxConcurrent = p.cfg.MaxConcurrent
@@ -297,6 +308,9 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		}
 	}
 	p.accounts = next
+	if reEnabled > 0 {
+		p.saveState()
+	}
 }
 
 // PickExcluding 挑一个健康账号。
@@ -484,14 +498,48 @@ func (p *Pool) AcquireLock(name string) bool {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.activeConcurrent >= a.maxConcurrent {
-			log.Printf("pool concurrent limit reached account=%s current=%d max=%d",
-				name, a.activeConcurrent, a.maxConcurrent)
+			// 槽位扫描（acquireSlot）会逐个试满号账号，这里不打印，避免刷屏；
+			// 真正等不到槽位时由调用方记录。
 			return false
 		}
 		a.activeConcurrent++
 		return true
 	}
 	return false
+}
+
+// AcquireAnyLockWait 等待任意一个健康账号的并发槽位并加锁。
+//
+// 池子满载时的正确排队方式：请求应该等「最先释放的账号」，而不是钉在某个账号上
+// 反复超时（那样会把换号预算耗光，最后给客户端 503）。skip 里的账号不参与。
+// 超时返回 nil。
+func (p *Pool) AcquireAnyLockWait(timeout time.Duration, skip map[string]bool) *Account {
+	deadline := time.Now().Add(timeout)
+	for {
+		now := time.Now()
+		p.mu.Lock()
+		for _, a := range p.accounts {
+			if skip != nil && skip[a.Name] {
+				continue
+			}
+			a.mu.Lock()
+			ok := !a.disabled && now.After(a.coolUntil) && a.activeConcurrent < a.maxConcurrent
+			if ok {
+				a.activeConcurrent++
+				a.keepaliveLastPing = time.Now()
+			}
+			a.mu.Unlock()
+			if ok {
+				p.mu.Unlock()
+				return a
+			}
+		}
+		p.mu.Unlock()
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // ReleaseLock 释放账号的并发请求锁，并唤醒等待槽位的请求。
@@ -921,14 +969,28 @@ func (p *Pool) loadState() {
 	if json.Unmarshal(raw, &data) != nil {
 		return
 	}
+	stateMod := int64(0)
+	if fi, statErr := os.Stat(p.state); statErr == nil {
+		stateMod = fi.ModTime().Unix()
+	}
 	for _, a := range p.accounts {
 		for _, s := range data {
 			if s.Name == a.Name {
+				// 凭证文件比状态文件新（重新登录/换过 token）：当时写下的
+				// 「终态失效」禁用已过期，不能恢复，否则用户重新登录 + 重启后
+				// 账号仍是 disabled，面板上看起来像登录没生效。
+				disabled := s.Disabled
+				reason := s.Reason
+				if disabled && a.Auth != nil && a.Auth.UpdatedAt > stateMod {
+					disabled = false
+					reason = ""
+					log.Printf("pool ignore stale disable account=%s (credentials updated after state)", a.Name)
+				}
 				a.mu.Lock()
 				a.errCount = s.ErrCount
 				a.coolUntil = s.CoolUntil
-				a.disabled = s.Disabled
-				a.disabledReason = s.Reason
+				a.disabled = disabled
+				a.disabledReason = reason
 				a.lastErr = s.LastErr
 				a.mu.Unlock()
 			}
