@@ -6,14 +6,22 @@
 ARG GO_IMAGE=golang:1.24-alpine
 ARG RUNTIME_IMAGE=alpine:3.20
 
-FROM ${GO_IMAGE} AS build
+# 构建阶段固定在构建机架构（BUILDPLATFORM），再用 GOOS/GOARCH 交叉编译到目标架构：
+# 多架构构建时 Go 编译不用走 QEMU，只有最终 alpine 阶段的 apk 需要模拟。
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
 COPY internal ./internal
-RUN go build -o /out/codearts2api ./cmd/server && \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -o /out/codearts2api ./cmd/server && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -o /out/codearts2api-login ./cmd/login && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -o /out/codearts2api-credit ./cmd/credit && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -o /out/codearts2api-apply ./cmd/apply
 
 FROM ${RUNTIME_IMAGE}

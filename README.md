@@ -187,6 +187,32 @@ docker pull docker.m.daocloud.io/library/alpine:3.20
 docker tag  docker.m.daocloud.io/library/alpine:3.20 alpine:3.20
 ```
 
+### 预构建镜像（GHCR）
+
+push 到 `main`、打 `v*` tag 或手动触发 [`.github/workflows/docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)
+会自动构建 **amd64/arm64 多架构**镜像并发布到 GitHub Packages，不需要本地编译：
+
+```bash
+docker pull ghcr.io/haoduck/codearts2api:latest
+# 版本 tag：v1.2.3 → 1.2.3 / 1.2 / 1；此外还有 main、sha-xxxxxxx
+```
+
+用镜像直接运行（等价于 `docker compose up --build`，但跳过本地构建）：
+
+```bash
+cp config.example.json config.json   # 按需修改；挂载前必须先存在
+mkdir -p auths data
+docker run -d --name codearts2api --restart unless-stopped \
+  -p 7866:7866 \
+  -e CA2A_API_KEY=你的随机密钥 -e TZ=Asia/Shanghai \
+  -v "$PWD/auths:/app/auths" -v "$PWD/data:/app/data" \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  ghcr.io/haoduck/codearts2api:latest
+```
+
+镜像内的 Go 编译在构建机架构上完成（`--platform=$BUILDPLATFORM` + `GOARCH=$TARGETARCH` 交叉编译），
+arm64 不需要 QEMU 模拟编译，只有最终 alpine 阶段的 `apk` 走模拟。
+
 ## 环境变量配置
 
 除了 `config.json`，还支持以下环境变量覆盖：
