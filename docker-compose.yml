@@ -1,5 +1,8 @@
 services:
   codearts2api:
+    # 镜像来源二选一：
+    #  A) 本地构建（默认）：需要能拉 golang/alpine 基础镜像。国内网络可用
+    #     CA2A_GO_IMAGE / CA2A_RUNTIME_IMAGE / CA2A_APK_MIRROR 换成镜像站（见 .env.example）。
     build:
       context: .
       args:
@@ -7,6 +10,9 @@ services:
         GO_IMAGE: ${CA2A_GO_IMAGE:-golang:1.24-alpine}
         RUNTIME_IMAGE: ${CA2A_RUNTIME_IMAGE:-alpine:3.20}
         APK_MIRROR: ${CA2A_APK_MIRROR:-}
+    #  B) 直接用 GitHub Actions 发布的预构建镜像（ghcr.io，多架构 amd64/arm64，免本地编译）：
+    #     把上面整个 build: 段（含 context/args）注释掉，再取消下面这行注释。
+    # image: ghcr.io/haoduck/codearts2api:latest
     container_name: codearts2api
     restart: unless-stopped
     ports:

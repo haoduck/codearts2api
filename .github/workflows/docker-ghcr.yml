@@ -13,6 +13,8 @@ on:
       - "**/*.md"
       - "docs/**"
       - ".github/workflows/go.yml"
+      - "docker-compose.yml"
+      - ".env.example"
       - "login.sh"
       - "apply.sh"
       - "credit.sh"
