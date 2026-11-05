@@ -302,3 +302,72 @@ func TestFlattenContent(t *testing.T) {
 }
 
 var _ = strings.TrimSpace
+
+// 客户端把文本放在各种形状里；解析不出来就会变成「空 user 消息」。
+func TestFlattenContentShapes(t *testing.T) {
+	cases := []struct{ name, raw, want string }{
+		{"string", `"你好"`, "你好"},
+		{"text parts", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "ab"},
+		{"input_text", `[{"type":"input_text","text":"x"}]`, "x"},
+		{"nested text value", `[{"type":"text","text":{"value":"y"}}]`, "y"},
+		{"anthropic tool_result", `[{"type":"tool_result","content":[{"type":"text","text":"z"}]}]`, "z"},
+		{"object content", `{"text":"w"}`, "w"},
+		{"image only", `[{"type":"image_url","image_url":{"url":"data:x"}}]`, ""},
+		{"null", `null`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := flattenContent(json.RawMessage(tc.raw)); got != tc.want {
+				t.Fatalf("flattenContent(%s)=%q want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// 空 user 内容必须拒：上游会把「空 user 消息」当成「继续上一个会话」，
+// 回一段与本次请求无关的内容（实测串出别的会话，表现为一句莫名其妙的问候语）。
+func TestParseChatRequestRejectsEmptyUserContent(t *testing.T) {
+	for _, body := range []string{
+		`{"messages":[{"role":"user","content":""}]}`,
+		`{"messages":[{"role":"user","content":"   "}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}`,
+	} {
+		_, err := parseChatRequest([]byte(body))
+		if err == nil {
+			t.Fatalf("body=%s 应当报错", body)
+		}
+		if !strings.Contains(err.Error(), "content 解析为空") {
+			t.Fatalf("body=%s err=%v, want content 解析为空", body, err)
+		}
+	}
+	// 多轮工具链里 tool 结果为空是合法的，不能拦。
+	if _, err := parseChatRequest([]byte(`{"messages":[{"role":"tool","tool_call_id":"c1","content":""}]}`)); err != nil {
+		t.Fatalf("空 tool 结果应放行: %v", err)
+	}
+	// 分片文本照常放行。
+	if _, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)); err != nil {
+		t.Fatalf("分片文本应放行: %v", err)
+	}
+}
+
+// 空 user 消息不能当 chat_id 锚点：否则所有解析失败的请求共用一个上游会话。
+func TestConversationIDForIgnoresEmptyUserMessages(t *testing.T) {
+	mk := func(text string) *chatRequest {
+		return &chatRequest{Messages: []openAIMessage{
+			{Role: "user", Text: ""},
+			{Role: "user", Text: text},
+		}}
+	}
+	a := conversationIDFor(mk("问题A"), "")
+	b := conversationIDFor(mk("问题B"), "")
+	if a == "" || b == "" {
+		t.Fatalf("anchor 不应为空: a=%q b=%q", a, b)
+	}
+	if a == b {
+		t.Fatalf("不同问题算出同一个 chat_id=%q（空 user 消息被当成了锚点）", a)
+	}
+	if got := conversationIDFor(&chatRequest{Messages: []openAIMessage{{Role: "user", Text: ""}}}, ""); got != "" {
+		t.Fatalf("全空消息的 anchor=%q，want 空（交给调用方生成随机 chat_id）", got)
+	}
+}
+

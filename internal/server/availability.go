@@ -143,6 +143,10 @@ func upstreamUnavailableReason(err error) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(msg, "4004.200") || strings.Contains(msg, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(msg, "tm.000010051") || strings.Contains(msg, "无权调用该模型"):
+		// 账号没有该模型的调用权限。这是「模型对这个账号不可用」，不是账号故障：
+		// 上游用 502 返回，若按 5xx 处理会把健康账号冷却 10 分钟（实测整池被打停）。
+		return "账号无权调用该模型（未开通）"
 	}
 	return ""
 }
@@ -235,6 +239,8 @@ func upstreamUnavailableReasonText(s string) string {
 		return "模型未在当前账号注册"
 	case strings.Contains(low, "4004.200") || strings.Contains(low, "benefit not found"):
 		return "限时福利未领取或已过期（可执行 go run ./cmd/models -claim，或打开 benefit_auto_claim）"
+	case strings.Contains(low, "tm.000010051") || strings.Contains(low, "无权调用该模型"):
+		return "账号无权调用该模型（未开通）"
 	}
 	return ""
 }

@@ -226,8 +226,8 @@ arm64 不需要 QEMU 模拟编译，只有最终 alpine 阶段的 `apk` 走模�
 | `CA2A_DEFAULT_MODEL` | 默认模型 | `glm-5.2` |
 | `CA2A_OAUTH_CALLBACK_HOST` | OAuth 回调主机 | - |
 | `CA2A_WATCH_ENABLED` | 调度器开关 | `true` |
-| `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
-| `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
+| `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `15` |
+| `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `60` |
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发数（上游单账号只有 3 个并发会话且释放慢，建议 2~3；设 1 时一个请求排队会阻塞整号） | `1` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |

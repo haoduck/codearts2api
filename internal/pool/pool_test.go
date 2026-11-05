@@ -1,10 +1,13 @@
 package pool
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,7 +170,7 @@ func TestValidateKeepsAccountEnabledAfterRetryableRefreshFailure(t *testing.T) {
 		time.Now().Add(30*time.Minute).Format(time.RFC3339), "refresh", "verifier",
 		map[string]string(dpopPrivateJWK),
 	)
-	p, err := New([]*auth.Auth{a}, Config{RefreshSkew: time.Hour, LoginConfig: loginCfg}, "")
+	p, err := New([]*auth.Auth{a}, Config{RefreshSkew: time.Hour, LoginConfig: loginCfg, RefreshRetries: 1}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,3 +199,100 @@ func TestRefreshSkewControlsThreshold(t *testing.T) {
 		t.Fatalf("剩余 2h、skew=1h 不应触发刷新: %v", err)
 	}
 }
+
+// 续期错误的重试判定：终态/明确 4xx 不重试，网络与 5xx/429 必须当场重试。
+//
+// refresh_token 是一次性轮换的：如果请求已经打到上游但我们没拿到响应（超时），
+// token 已被换走；等到下一轮 watchdog 再试只会得到 STS5.1806 "has been used"，
+// 账号永久报废（实测 2026-11-04 10:31 丢了 one7312）。当场重试是唯一能救回的路径。
+func TestShouldRetryRefresh(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"terminal reuse-detected", &upstream.RefreshTokenExpiredError{Status: 400, Message: "has been used"}, false},
+		{"terminal wrapped", fmt.Errorf("refresh failed: %w", &upstream.RefreshTokenExpiredError{Status: 400}), false},
+		{"http 400", &upstream.ApiError{Status: 400}, false},
+		{"http 401", &upstream.ApiError{Status: 401}, false},
+		{"http 429 rate limited", &upstream.ApiError{Status: 429}, true},
+		{"http 502", &upstream.ApiError{Status: 502}, true},
+		{"http 503 wrapped", fmt.Errorf("refresh failed: %w", &upstream.ApiError{Status: 503}), true},
+		{"network", errors.New("dial tcp 1.2.3.4:443: i/o timeout"), true},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldRetryRefresh(c.err); got != c.want {
+				t.Fatalf("shouldRetryRefresh(%v)=%v want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+
+// 可重试错误（502/网络）必须当场重试：refresh_token 一次性轮换，等到下一轮
+// watchdog 再试就已经变成 "has been used"，账号直接报废。
+func TestRefreshTokenRetriesRetryableFailures(t *testing.T) {
+	var hits int32
+	sts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Error(w, "temporary upstream outage", http.StatusBadGateway)
+	}))
+	defer sts.Close()
+	p := newRefreshTestPool(t, sts.URL, "u-retry", Config{
+		RefreshRetries:    3,
+		RefreshRetryDelay: time.Millisecond,
+	})
+	if err := p.RefreshToken("u-retry"); err == nil {
+		t.Fatal("502 应当返回错误")
+	}
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("尝试 %d 次，want 3", got)
+	}
+}
+
+// 终态错误（refresh_token 已被用过）不能重试：多打两次上游毫无意义。
+func TestRefreshTokenDoesNotRetryTerminalError(t *testing.T) {
+	var hits int32
+	sts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'the refresh token has been used'"}`))
+	}))
+	defer sts.Close()
+	p := newRefreshTestPool(t, sts.URL, "u-terminal", Config{
+		RefreshRetries:    3,
+		RefreshRetryDelay: time.Millisecond,
+	})
+	err := p.RefreshToken("u-terminal")
+	var expired *upstream.RefreshTokenExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("err=%T %v，want RefreshTokenExpiredError", err, err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("终态错误打了 %d 次上游，want 1", got)
+	}
+}
+
+// newRefreshTestPool 造一个带 refresh_token 的账号，STS 指向测试服务器。
+func newRefreshTestPool(t *testing.T, stsURL, name string, cfg Config) *Pool {
+	t.Helper()
+	dpopPrivateJWK, err := upstream.NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginCfg := upstream.DefaultLoginConfig()
+	loginCfg.STSHost = stsURL
+	cfg.LoginConfig = loginCfg
+	a := auth.New(name, "user", "domain", "token", "ak", "sk",
+		time.Now().Add(30*time.Minute).Format(time.RFC3339), "refresh", "verifier",
+		map[string]string(dpopPrivateJWK))
+	p, err := New([]*auth.Auth{a}, cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+

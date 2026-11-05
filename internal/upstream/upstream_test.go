@@ -271,7 +271,41 @@ func TestOAuthRefreshClassifiesExpiredRefreshToken(t *testing.T) {
 	if !errors.As(err, &expired) {
 		t.Fatalf("refresh error=%T %v, want RefreshTokenExpiredError", err, err)
 	}
+	if expired.Code != "IAM.ExpiredRefreshToken" || expired.Reason != "refresh token expired" {
+		t.Fatalf("code/reason=%q/%q, want upstream code and msg preserved", expired.Code, expired.Reason)
+	}
+	if got, want := expired.Short(), "IAM.ExpiredRefreshToken: refresh token expired"; got != want {
+		t.Fatalf("Short()=%q, want %q", got, want)
+	}
 }
+
+// TestOAuthRefreshKeepsReuseDetectedDetail 覆盖轮换重放：上游对「已被使用过」
+// 的 refresh_token 返回 STS5.1806。账号被禁用时 reason 必须带上这段上游
+// 原文，否则面板上只会看到「过期」，把「被别处刷新过」误判成时间到了。
+func TestOAuthRefreshKeepsReuseDetectedDetail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'the refresh token has been used'"}`)
+	}))
+	defer srv.Close()
+	privateJWK, err := NewDPoPPrivateJWK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultLoginConfig()
+	cfg.STSHost = srv.URL
+	_, err = New(5*time.Second).RefreshToken(context.Background(), cfg, "used", "verifier", privateJWK)
+	var expired *RefreshTokenExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("refresh error=%T %v, want RefreshTokenExpiredError", err, err)
+	}
+	short := expired.Short()
+	if !strings.Contains(short, "STS5.1806") || !strings.Contains(short, "has been used") {
+		t.Fatalf("Short()=%q, want STS5.1806 + reuse-detected message", short)
+	}
+}
+
 
 func decodeDPoP(t *testing.T, proof string) (map[string]any, map[string]any) {
 	t.Helper()

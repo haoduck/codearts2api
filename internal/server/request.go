@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"codearts2api/internal/upstream"
@@ -113,17 +114,32 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("messages[%d]: %w", i, err)
 		}
+		if m.Role == "user" && strings.TrimSpace(m.Text) == "" && len(rm) > 0 {
+			// 能读的字段都读不出来：把原始片段打出来，便于定位客户端到底把
+			// 文本放哪了（这是「模型只回一句问候语」这类现象的唯一线索）。
+			log.Printf("request: messages[%d] role=user content 解析为空 raw=%s", i, truncateMsg(string(rm), 240))
+		}
 		req.Messages = append(req.Messages, m)
 	}
-	// 至少要有一条 user 或 tool 消息（否则没有可发送的内容）。
-	hasSendable := false
+	// 必须有一条真能发出内容的 user/tool 消息。空 user 消息不能放行：
+	// 上游会把它当成「继续上一个会话」，回一段与本次请求无关的内容。
+	hasSendable, hasUser := false, false
 	for _, m := range req.Messages {
-		if m.Role == "user" || m.Role == "tool" {
+		switch m.Role {
+		case "user":
+			hasUser = true
+			if strings.TrimSpace(m.Text) != "" {
+				hasSendable = true
+			}
+		case "tool":
 			hasSendable = true
-			break
 		}
 	}
 	if !hasSendable {
+		if hasUser {
+			return nil, errors.New("user 消息的 content 解析为空：文本要放在 content 字符串里，或 [{\"type\":\"text\",\"text\":\"...\"}] 分片里" +
+				"（空内容会被上游当成「继续上一个会话」，返回与本次请求无关的内容）")
+		}
 		return nil, errors.New("no user or tool message found")
 	}
 	return req, nil
@@ -172,6 +188,13 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 }
 
 // flattenContent 拍平 string / 分片 content 为纯文本。
+//
+// 不同客户端把文本放在不同形状里：字符串、[{type:text,text}]、OpenAI Responses
+// 的 input_text/output_text、Anthropic 的 {type:text,text}，甚至
+// {"text":{"value":"..."}} 这类嵌套对象。解析不出来就返回空串，但空串
+// **绝不能原样发给上游**：CodeArts 会把「空 user 消息」当成「继续上一个会话」，
+// 回一段与本次请求无关的历史内容（实测会串出同账号别的会话，表现为一句
+// 莫名其妙的问候语）。因此 parseChatRequest 会直接拒绝这种请求。
 func flattenContent(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
@@ -180,15 +203,46 @@ func flattenContent(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
-	var parts []map[string]any
+	var parts []json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err == nil {
 		var sb strings.Builder
 		for _, p := range parts {
-			if t, ok := p["text"].(string); ok {
-				sb.WriteString(t)
-			}
+			sb.WriteString(textFromPart(p))
 		}
 		return sb.String()
+	}
+	return textFromPart(raw)
+}
+
+// textFromPart 从单个 content 分片里取文本（兼容嵌套 content/value）。
+func textFromPart(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	for _, key := range []string{"text", "input_text", "output_text", "content", "value"} {
+		v, ok := obj[key]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			return t
+		case map[string]any:
+			for _, nested := range []string{"value", "text"} {
+				if str, ok := t[nested].(string); ok {
+					return str
+				}
+			}
+		case []any:
+			if nested, err := json.Marshal(t); err == nil {
+				return flattenContent(nested)
+			}
+		}
 	}
 	return ""
 }
@@ -313,16 +367,19 @@ func conversationIDFor(req *chatRequest, headerValue string) string {
 		return hex.EncodeToString(sum[:16])
 	}
 	for _, message := range req.Messages {
-		if message.Role == "user" {
-			anchor := canonical(message)
-			if len(req.Tools) > 0 {
-				// OpenCode 会用同一用户消息先请求无工具的会话标题，再启动工具 Agent。
-				// 两者必须分开，否则标题生成会污染内置 Agent 会话。
-				anchor += "\x00tools"
-			}
-			sum := sha256.Sum256([]byte(anchor))
-			return hex.EncodeToString(sum[:16])
+		// 空内容的 user 消息不能当锚点：所有解析失败的请求都会算出同一个
+		// chat_id，等于把这些请求全部塞进上游同一个会话（会串出别人的历史）。
+		if message.Role != "user" || strings.TrimSpace(message.Text) == "" {
+			continue
 		}
+		anchor := canonical(message)
+		if len(req.Tools) > 0 {
+			// OpenCode 会用同一用户消息先请求无工具的会话标题，再启动工具 Agent。
+			// 两者必须分开，否则标题生成会污染内置 Agent 会话。
+			anchor += "\x00tools"
+		}
+		sum := sha256.Sum256([]byte(anchor))
+		return hex.EncodeToString(sum[:16])
 	}
 	return ""
 }

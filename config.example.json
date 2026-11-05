@@ -20,8 +20,8 @@
   "keepalive_window": "10m",     // 保活心跳窗口，超过此时间无活动则发送心跳（默认 10m）
   "watch": {
     "enabled": true,
-    "poll_minutes": 30,
-    "refresh_skew_minutes": 30,
+    "poll_minutes": 15,            // 巡检间隔：必须显著小于 refresh_skew，否则 token 过期后才刷新
+    "refresh_skew_minutes": 60,    // 到期前多久刷新：STS token 只有 2h，留 1h 裕量给失败重试
     "keepalive_interval_minutes": 15  // 保活心跳间隔（新增，默认 15m）
   },
   "upstream": {

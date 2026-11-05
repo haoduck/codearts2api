@@ -75,8 +75,10 @@ func Default() *Config {
 	c.Cooldown.ErrThresh = 3
 	c.Cooldown.ErrCooldown = "10m"
 	c.Watch.Enabled = true
-	c.Watch.PollMinutes = 30
-	c.Watch.RefreshSkewM = 30
+	// poll 必须显著小于 refresh_skew：token 只有 2 小时，两者相等时最后一次
+	// 本该刷新的 tick 会正好落在过期之后（实测 2026-11-04 因此永久掉号）。
+	c.Watch.PollMinutes = 15
+	c.Watch.RefreshSkewM = 60
 	c.Watch.KeepaliveInterval = 15 // 新增：保活间隔 15 分钟
 	c.MaxConcurrent = 1            // 上游单账号最多 3 并发会话但释放慢，串行最稳
 	c.KeepaliveWindow = "10m"      // 新增：保活窗口 10 分钟
@@ -256,10 +258,10 @@ func (c *Config) normalize() error {
 		c.Listen = ":" + c.Listen
 	}
 	if c.Watch.PollMinutes <= 0 {
-		c.Watch.PollMinutes = 30
+		c.Watch.PollMinutes = 15
 	}
 	if c.Watch.RefreshSkewM <= 0 {
-		c.Watch.RefreshSkewM = 30
+		c.Watch.RefreshSkewM = 60
 	}
 	if c.Watch.KeepaliveInterval <= 0 {
 		c.Watch.KeepaliveInterval = 15 // 默认保活间隔 15 分钟

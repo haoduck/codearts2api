@@ -19,6 +19,9 @@ func TestUpstreamUnavailableReason(t *testing.T) {
 	}{
 		{`codearts error code=InferHub.002002009.404 msg=The model is not registered, please request other model`, "注册"},
 		{`codearts error code=InferHub.4004.200 msg=benefit not found`, "福利"},
+		// 账号没有该模型的调用权限：上游用 502 返回，但这是模型级问题，
+		// 不能按 5xx 冷却健康账号（实测会把整池打停 10 分钟）。
+		{`codearts api code=502 http=502 path=/api/v2/chat/completions msg=TM.000010051 您当前无权调用该模型，请联系企业管理员开通。`, "无权"},
 		{`codearts error code=TM.00001041 msg=并发会话数已达上限`, ""},
 		{`dial tcp: i/o timeout`, ""},
 	}

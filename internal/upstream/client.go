@@ -73,10 +73,29 @@ type TokenResponse struct {
 // 它与网络/5xx 等可重试错误分开，避免无限刷新。
 type RefreshTokenExpiredError struct {
 	Status  int
+	Code    string // 上游 error_code，如 STS5.1806 / IAM.ExpiredRefreshToken
+	Reason  string // 上游 error_msg 原文（已截断）
 	Message string
 }
 
 func (e *RefreshTokenExpiredError) Error() string { return e.Message }
+
+// Short 返回可写进账号状态/日志的简短原因，例如
+// "STS5.1806: invalid refresh token: 'the refresh token has been used'"。
+//
+// 账号被禁用时面板只显示一行 reason，必须带上上游 code/msg 才能区分
+// 「真过期」「被别处刷新过（轮换重放）」「DPoP/client_id 不匹配」——
+// 这三种情况都要求重新登录，但处置方式完全不同。
+func (e *RefreshTokenExpiredError) Short() string {
+	switch {
+	case e.Code != "" && e.Reason != "":
+		return e.Code + ": " + e.Reason
+	case e.Code != "":
+		return e.Code
+	default:
+		return e.Reason
+	}
+}
 
 // LoginConfig 登录相关配置。
 type LoginConfig struct {
@@ -317,6 +336,8 @@ func (c *Client) requestToken(ctx context.Context, cfg LoginConfig, form url.Val
 				strings.Contains(strings.ToLower(tokenErr.ErrorMessage), "has been used") {
 				return nil, &RefreshTokenExpiredError{
 					Status: resp.StatusCode,
+					Code:   tokenErr.ErrorCode,
+					Reason: truncateStr(tokenErr.ErrorMessage, 160),
 					Message: fmt.Sprintf("refresh_token expired or rejected: http=%d error=%s code=%s msg=%s",
 						resp.StatusCode, tokenErr.Error, tokenErr.ErrorCode, truncateStr(tokenErr.ErrorMessage, 160)),
 				}

@@ -49,6 +49,8 @@ type Account struct {
 	activeConcurrent  int       // 当前活跃并发请求数
 	maxConcurrent     int       // 最大允许并发数
 	keepaliveLastPing time.Time // 最后保活心跳时间
+	claimedCredits    float64          // 累计领取到的积分（签到/新手活动，非余额）
+	claimedCampaigns  map[int]float64 // 活动ID → 已领面额（逐活动幂等记账）
 }
 
 // Config 池配置。
@@ -61,6 +63,13 @@ type Config struct {
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+
+	// RefreshRetries 续期失败后的尝试次数（含首次），默认 3。
+	// refresh_token 一次性轮换：请求可能已打到上游但响应丢失，此时必须当场重试，
+	// 否则下一轮 watchdog 再试只会得到 STS5.1806 "has been used"。
+	RefreshRetries int
+	// RefreshRetryDelay 重试退避基数（第 n 次重试等 n*base），默认 3s。
+	RefreshRetryDelay time.Duration
 }
 
 // Pool 账号池。
@@ -92,6 +101,12 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	}
 	if cfg.KeepaliveWindow <= 0 {
 		cfg.KeepaliveWindow = 10 * time.Minute // 10 分钟无活动则保活
+	}
+	if cfg.RefreshRetries <= 0 {
+		cfg.RefreshRetries = defaultRefreshRetries
+	}
+	if cfg.RefreshRetryDelay <= 0 {
+		cfg.RefreshRetryDelay = defaultRefreshRetryBase
 	}
 	if cfg.LoginConfig.ClientID == "" {
 		cfg.LoginConfig = upstream.DefaultLoginConfig()
@@ -192,6 +207,7 @@ func (p *Pool) List() []map[string]any {
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
 			"credits":           int64(0), // 保留旧字段；未查询真实余额
+			"claimed_credits":   a.claimedCredits,
 			"checkin":           a.checkin,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
@@ -361,7 +377,16 @@ func (p *Pool) Validate(a *Account) (bool, error) {
 		if err := p.RefreshToken(a.Name); err != nil {
 			var expired *upstream.RefreshTokenExpiredError
 			if errors.As(err, &expired) {
-				p.Disable(a.Name, "refresh_token expired; re-login required")
+				// 终态失效：只能重新登录。把上游原始 code/msg 一并写进
+				// 状态与日志——只写 "refresh_token expired" 会把
+				// STS5.1806（refresh_token 已被别处刷新过/轮换重放）
+				// 这类关键信息抹掉，事后无法判断是上游踢出还是本地没刷新。
+				reason := "refresh_token rejected; re-login required"
+				if short := expired.Short(); short != "" {
+					reason += " (" + short + ")"
+				}
+				log.Printf("pool refresh rejected account=%s status=%d detail=%s", a.Name, expired.Status, expired.Message)
+				p.Disable(a.Name, reason)
 				return false, nil
 			}
 			// 网络/5xx 属于可重试错误：保持账号可调度，由后续
@@ -667,7 +692,36 @@ func (p *Pool) CheckAndRefreshToken(name string) error {
 	return p.CheckAndRefreshTokenWithin(name, time.Hour)
 }
 
-// RefreshToken 手动刷新指定账号的 token。
+// 续期失败后的当场重试（次数/退避见 Config.RefreshRetries、RefreshRetryDelay）：
+// refresh_token 是一次性轮换的，如果这次请求其实已经打到上游（典型是读响应超时/
+// 连接被重置），token 已被换走而我们没拿到新的，等到下一轮 watchdog（30 分钟后）
+// 再试只会得到 STS5.1806 "has been used"，账号直接报废（实测 2026-11-04 10:31
+// 就是这样丢的 one7312）。当场重试还有机会：若第一次根本没到上游，重试就能成功。
+const (
+	defaultRefreshRetries   = 3
+	defaultRefreshRetryBase = 3 * time.Second
+)
+
+// shouldRetryRefresh 判断续期错误是否值得当场重试。
+//
+// 终态（refresh_token 被上游判死）和明确的 4xx（参数/凭证问题）重试没有意义；
+// 网络错误、超时、5xx、429 都值得再试一次。
+func shouldRetryRefresh(err error) bool {
+	if err == nil {
+		return false
+	}
+	var expired *upstream.RefreshTokenExpiredError
+	if errors.As(err, &expired) {
+		return false
+	}
+	var ae *upstream.ApiError
+	if errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500 && ae.Status != 429 {
+		return false
+	}
+	return true
+}
+
+// RefreshToken 刷新指定账号的 token（可重试错误会当场重试）。
 func (p *Pool) RefreshToken(name string) error {
 	p.mu.Lock()
 	var acct *Account
@@ -684,6 +738,31 @@ func (p *Pool) RefreshToken(name string) error {
 	acct.refreshMu.Lock()
 	defer acct.refreshMu.Unlock()
 
+	var lastErr error
+	attempts := p.cfg.RefreshRetries
+	delay := p.cfg.RefreshRetryDelay
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := p.refreshTokenOnce(acct)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("pool token refresh ok account=%s attempts=%d", acct.Name, attempt)
+			}
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryRefresh(err) {
+			return err
+		}
+		if attempt < attempts {
+			log.Printf("pool token refresh retry account=%s attempt=%d/%d err=%v", acct.Name, attempt, attempts, err)
+			time.Sleep(delay * time.Duration(attempt))
+		}
+	}
+	return lastErr
+}
+
+// refreshTokenOnce 单次续期（调用方必须持有 acct.refreshMu）。
+func (p *Pool) refreshTokenOnce(acct *Account) error {
 	authz := acct.Auth
 	refreshToken := authz.Refresh()
 	if refreshToken == "" {
@@ -714,7 +793,8 @@ func (p *Pool) RefreshToken(name string) error {
 	acct.lastErr = ""
 	acct.lastValidated = time.Now()
 	acct.mu.Unlock()
-	log.Printf("pool token refreshed manually account=%s", name)
+	log.Printf("pool token refreshed account=%s remaining=%s",
+		acct.Name, authz.Remaining().Round(time.Minute))
 	return nil
 }
 
@@ -950,6 +1030,12 @@ func (p *Pool) SetMaxConcurrent(name string, max int) {
 	}
 }
 
+// campaignClaim 已领取活动的持久化条目（活动ID + 面额）。
+type campaignClaim struct {
+	ID     int     `json:"id"`
+	Amount float64 `json:"amount"`
+}
+
 func (p *Pool) loadState() {
 	if p.state == "" {
 		return
@@ -959,12 +1045,14 @@ func (p *Pool) loadState() {
 		return
 	}
 	var data []struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name             string          `json:"name"`
+		ErrCount         int             `json:"err_count"`
+		CoolUntil        time.Time       `json:"cool_until"`
+		Disabled         bool            `json:"disabled"`
+		Reason           string          `json:"reason"`
+		LastErr          string          `json:"last_error"`
+		ClaimedCredits   float64         `json:"claimed_credits"`
+		ClaimedCampaigns []campaignClaim `json:"claimed_campaigns"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
 		return
@@ -992,6 +1080,13 @@ func (p *Pool) loadState() {
 				a.disabled = disabled
 				a.disabledReason = reason
 				a.lastErr = s.LastErr
+				a.claimedCredits = s.ClaimedCredits
+				if len(s.ClaimedCampaigns) > 0 {
+					a.claimedCampaigns = make(map[int]float64, len(s.ClaimedCampaigns))
+					for _, c := range s.ClaimedCampaigns {
+						a.claimedCampaigns[c.ID] = c.Amount
+					}
+				}
 				a.mu.Unlock()
 			}
 		}
@@ -1003,23 +1098,32 @@ func (p *Pool) saveState() {
 		return
 	}
 	type entry struct {
-		Name      string    `json:"name"`
-		ErrCount  int       `json:"err_count"`
-		CoolUntil time.Time `json:"cool_until"`
-		Disabled  bool      `json:"disabled"`
-		Reason    string    `json:"reason"`
-		LastErr   string    `json:"last_error"`
+		Name             string          `json:"name"`
+		ErrCount         int             `json:"err_count"`
+		CoolUntil        time.Time       `json:"cool_until"`
+		Disabled         bool            `json:"disabled"`
+		Reason           string          `json:"reason"`
+		LastErr          string          `json:"last_error"`
+		ClaimedCredits   float64         `json:"claimed_credits"`
+		ClaimedCampaigns []campaignClaim `json:"claimed_campaigns,omitempty"`
 	}
 	out := make([]entry, 0, len(p.accounts))
 	for _, a := range p.accounts {
 		a.mu.Lock()
+		var campaigns []campaignClaim
+		for id, amount := range a.claimedCampaigns {
+			campaigns = append(campaigns, campaignClaim{ID: id, Amount: amount})
+		}
+		sort.Slice(campaigns, func(i, j int) bool { return campaigns[i].ID < campaigns[j].ID })
 		out = append(out, entry{
-			Name:      a.Name,
-			ErrCount:  a.errCount,
-			CoolUntil: a.coolUntil,
-			Disabled:  a.disabled,
-			Reason:    a.disabledReason,
-			LastErr:   a.lastErr,
+			Name:             a.Name,
+			ErrCount:         a.errCount,
+			CoolUntil:        a.coolUntil,
+			Disabled:         a.disabled,
+			Reason:           a.disabledReason,
+			LastErr:          a.lastErr,
+			ClaimedCredits:   a.claimedCredits,
+			ClaimedCampaigns: campaigns,
 		})
 		a.mu.Unlock()
 	}
