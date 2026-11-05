@@ -642,7 +642,8 @@ func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.A
 // 返回 nil 表示所有账号要么不健康、要么槽位都满了。
 func (h *Handler) acquireSlot(skip map[string]bool, model string) *pool.Account {
 	want := strings.ToLower(upstream.CanonicalModel(model))
-	for _, acct := range h.cfg.Pool.Accounts() {
+	// 轮转顺序：并发为 1 时也不能总选同一个账号（见 Pool.AccountsRotated）。
+	for _, acct := range h.cfg.Pool.AccountsRotated() {
 		if acct == nil || skip[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
@@ -703,6 +704,12 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 // chat
 // ---------------------------------------------------------------------------
+
+// credentialOf 取账号当前的 STS 签名凭证快照。
+func credentialOf(acct *pool.Account) upstream.SignCredential {
+	token, ak, sk := acct.Auth.Credentials()
+	return upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
+}
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
@@ -809,12 +816,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			chatID = randHex(32)
 		}
 
-		token, accessKeyID, secretAccessKey := acct.Auth.Credentials()
-		cred := upstream.SignCredential{
-			AccessKeyID:     accessKeyID,
-			SecretAccessKey: secretAccessKey,
-			SecurityToken:   token,
-		}
+		cred := credentialOf(acct)
 		chatOpts := upstream.ChatOptions{
 			ReasoningEffort: req.ReasoningEffort,
 			MaxTokens:       req.MaxTokens,
@@ -823,13 +825,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
 		}
-		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
-		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
-		// 等待期间释放并发锁，让排队的请求也能尝试（避免死锁式串行等待）。
+		// 上游并发会话/TPM 排队是瞬时的。先尝试换号（每个账号的上游会话
+		// 槽位是独立的，别的账号空闲时换过去立刻能跑），没有别的账号可用时
+		// 才原地等这个账号释放。
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
-		holding := true // 是否仍持有 acct 的并发槽位
+		queueSwitches := 0 // 因上游排队而换号的次数
+		holding := true    // 是否仍持有 acct 的并发槽位
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
@@ -841,12 +844,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			var ae *upstream.ApiError
 			if errors.As(serr, &ae) && (ae.Status == 401 || ae.Code == 401) && !authRetried && acct.Auth.Refresh() != "" {
 				if rerr := h.cfg.Pool.RefreshToken(acct.Name); rerr == nil {
-					token, accessKeyID, secretAccessKey = acct.Auth.Credentials()
-					cred = upstream.SignCredential{
-						AccessKeyID:     accessKeyID,
-						SecretAccessKey: secretAccessKey,
-						SecurityToken:   token,
-					}
+					cred = credentialOf(acct)
 					authRetried = true
 					log.Printf("upstream 401 account=%s: token refreshed, retrying request once", acct.Name)
 					continue
@@ -855,13 +853,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
-				// 上游排队是「整个账号的会话槽位」满了，换号没用：别的账号的
-				// 本地槽位可能空着，但上游会话同样没释放。原地等上游释放
-				// （实测十几秒），比自己空转或反复换号都快。
-				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
-				// 释放锁让其他请求有机会，等待后重新获取
-				h.cfg.Pool.ReleaseLock(acct.Name)
-				holding = false
+				// 上游会话槽位是**按账号**算的（单账号 3 个、释放很慢）。
+				// 所以先换号：别的账号空闲时换过去立刻能跑，比在同一个账号上
+				// 干等 10s 快得多，也不会把一条请求钉死在一个账号上。
+				if holding {
+					h.cfg.Pool.ReleaseLock(acct.Name)
+					holding = false
+				}
+				if queueSwitches < h.cfg.MaxRotate {
+					if next := h.acquireSlot(tried, model); next != nil {
+						queueSwitches++
+						tried[next.Name] = true
+						log.Printf("upstream queue limit account=%s → switch %s (%d/%d)",
+							acct.Name, next.Name, queueSwitches, h.cfg.MaxRotate)
+						acct = next
+						holding = true
+						cred = credentialOf(acct)
+						// 限时福利路由按账号判定，换号后要重新算。
+						benefit = upstream.IsBenefitModel(acct.UID, model)
+						noteTraffic(acct.UID)
+						continue
+					}
+				}
+				// 没有别的账号可换（都忙/都不支持该模型）：原地等这个账号释放。
+				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s",
+					retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
 				select {
 				case <-time.After(h.cfg.QueueRetryDelay):
 				case <-r.Context().Done():

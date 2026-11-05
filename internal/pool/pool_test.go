@@ -296,3 +296,35 @@ func newRefreshTestPool(t *testing.T, stsURL, name string, cfg Config) *Pool {
 	return p
 }
 
+
+// 选号必须轮转：并发为 1 时也不能每条请求都落在同一个账号上
+// （first-fit 会把第一个账号的上游会话槽位堆满，触发 TM.00001041 排队）。
+func TestAccountsRotatedCycles(t *testing.T) {
+	mk := func(name string) *auth.Auth {
+		return auth.New(name, "user-"+name, "domain", "token", "ak", "sk",
+			time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
+	}
+	p, err := New([]*auth.Auth{mk("a1"), mk("a2"), mk("a3")}, Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a1", "a2", "a3", "a1", "a2", "a3"}
+	for i, expected := range want {
+		rot := p.AccountsRotated()
+		if len(rot) != 3 {
+			t.Fatalf("第 %d 次返回 %d 个账号，want 3", i, len(rot))
+		}
+		if rot[0].Name != expected {
+			t.Fatalf("第 %d 次首选=%s，want %s", i, rot[0].Name, expected)
+		}
+		// 轮转只改起点，不能重复或漏账号。
+		seen := map[string]int{}
+		for _, acct := range rot {
+			seen[acct.Name]++
+		}
+		if len(seen) != 3 {
+			t.Fatalf("第 %d 次轮转结果有重复/遗漏: %v", i, seen)
+		}
+	}
+}
+

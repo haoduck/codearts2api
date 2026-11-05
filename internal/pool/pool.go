@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -78,6 +79,10 @@ type Pool struct {
 	state    string
 	mu       sync.Mutex
 	accounts []*Account
+	// pickCursor 轮转游标：顺序请求必须依次落到不同账号，否则并发为 1 时
+	// 每条请求都落在第一个账号上，把它的上游会话槽位堆满（TM.00001041 排队），
+	// 而其余账号全空着。
+	pickCursor atomic.Uint64
 }
 
 // New 构建池。
@@ -133,6 +138,25 @@ func (p *Pool) Accounts() []*Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.accounts
+}
+
+// AccountsRotated 返回从轮转游标开始的账号快照（每次调用游标前移一位）。
+//
+// 选号必须轮转：`Accounts()` 是固定顺序，配合「取第一个有空槽的账号」就是
+// first-fit——并发为 1 时永远选同一个账号，上游会话槽位（单账号 3 个、释放慢）
+// 被堆满后一直排队，其余账号却全空闲。
+func (p *Pool) AccountsRotated() []*Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.accounts)
+	if n == 0 {
+		return nil
+	}
+	start := int((p.pickCursor.Add(1) - 1) % uint64(n))
+	out := make([]*Account, 0, n)
+	out = append(out, p.accounts[start:]...)
+	out = append(out, p.accounts[:start]...)
+	return out
 }
 
 // Get 按名字取账号。
