@@ -38,8 +38,10 @@ type CreditClaimResult struct {
 	Title      string  `json:"title"`
 	OK         bool    `json:"ok"`
 	Status     string  `json:"status"`
-	Credits    float64 `json:"credits,omitempty"`
-	Message    string  `json:"message"`
+	Credits    float64 `json:"credits,omitempty"` // 本次领取量
+	// Amount 该活动的面额（已领取过时也能拿到），用于统计"累计领取"。
+	Amount  float64 `json:"amount,omitempty"`
+	Message string  `json:"message"`
 }
 
 // CheckinResult 的 Credits 是本次领取量，不是账号余额。
@@ -147,6 +149,12 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 
 func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, now time.Time) CreditClaimResult {
 	res := CreditClaimResult{CampaignID: campaign.ID, Title: campaign.Title, Status: strings.TrimSpace(campaign.Status), OK: true}
+	// 面额：待发放量优先，其次活动配置量。已领取过的活动同样能拿到，
+	// 供「累计领取」统计使用（本次领取量见 Credits）。
+	res.Amount = campaign.PendingTotalAmount
+	if res.Amount <= 0 {
+		res.Amount = campaign.BenefitAmount
+	}
 	if res.Title == "" {
 		res.Title = fmt.Sprintf("积分活动 %d", campaign.ID)
 	}

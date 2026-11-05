@@ -38,7 +38,9 @@ type Config struct {
 	QueueMaxAttempts int
 	DefaultModel     string
 	ConvStateFile    string
-	WatchInfo        map[string]any
+	// UsageFile 用量统计落盘路径（空则只在内存里统计，不持久化）。
+	UsageFile string
+	WatchInfo map[string]any
 	AuthDir          string
 	Listen           string
 	// OAuthClient 短超时客户端，用于 WebUI 登录换取 token（可注入测试端点）。
@@ -108,6 +110,8 @@ type Handler struct {
 	chats  map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
 	convAcct map[string]string
+	// usage 代理侧 token 用量统计（按 天×账号×模型 聚合）。
+	usage *usageStore
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
@@ -161,6 +165,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
 		convAcct: map[string]string{},
+		usage:    newUsageStore(cfg.UsageFile),
 	}
 	h.loadChats()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -177,6 +182,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
 	h.mux.HandleFunc("POST /admin/api/keepalive", h.withAuth(h.adminKeepalive))
 	h.mux.HandleFunc("POST /admin/api/reload", h.withAuth(h.adminReload))
+	h.mux.HandleFunc("GET /admin/api/logs", h.withAuth(h.adminLogs))
+	h.mux.HandleFunc("GET /admin/api/usage", h.withAuth(h.adminUsage))
 	h.mux.HandleFunc("POST /admin/api/accounts/enable", h.withAuth(h.adminEnable))
 	h.mux.HandleFunc("POST /admin/api/accounts/disable", h.withAuth(h.adminDisable))
 	h.mux.HandleFunc("POST /admin/api/accounts/clear-cooldown", h.withAuth(h.adminClearCooldown))
@@ -916,6 +923,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
+				h.recordUsage(acct, model, msgs, comp)
 			}, usage)
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
@@ -962,6 +970,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		storeChat()
 		h.cfg.Pool.NoteSuccess(acct.Name)
+		h.recordUsage(acct, model, msgs, comp)
 
 		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
 		return
@@ -1113,6 +1122,18 @@ func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) ma
 	}
 	ct := (len([]rune(comp.Content))+len([]rune(comp.Reasoning)))/4 + 1
 	return map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+}
+
+// recordUsage 记一次请求的用量（代理侧 token 计数）。
+//
+// 只统计真正成功的请求；上游没给 usage 时按字符数估算（与响应里的 usage 同源）。
+func (h *Handler) recordUsage(acct *pool.Account, model string, msgs []upstream.ChatMessage, comp *upstream.RawCompletion) {
+	if h.usage == nil || acct == nil || comp == nil {
+		return
+	}
+	c := usageCountsFromMap(usageEstimate(msgs, comp))
+	c.Requests = 1
+	h.usage.add(acct.UID, model, c)
 }
 
 // buildCompletion 组装非流式响应。

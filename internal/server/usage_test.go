@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -128,3 +129,68 @@ func TestChatCompletionsUsage(t *testing.T) {
 		})
 	}
 }
+
+// 用量按 天×账号×模型 聚合，并能在重启后从磁盘恢复。
+func TestUsageStoreAggregatesAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	s := newUsageStore(path)
+	s.now = func() time.Time { return time.Date(2026, 11, 4, 10, 0, 0, 0, time.Local) }
+
+	s.add("acct-a", "GLM-5.2", usageCounts{Requests: 1, PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150})
+	s.add("acct-a", "GLM-5.2", usageCounts{Requests: 1, PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15})
+	s.add("acct-b", "glm-5.3", usageCounts{Requests: 1, PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10})
+
+	rep := s.snapshot(7)
+	if rep.Total.Requests != 3 || rep.Total.TotalTokens != 175 {
+		t.Fatalf("total=%+v，want 3 请求 / 175 token", rep.Total)
+	}
+	if rep.Today.TotalTokens != 175 {
+		t.Fatalf("today=%+v，want 175", rep.Today)
+	}
+	if len(rep.ByAccount) != 2 || rep.ByAccount[0].Key != "acct-a" || rep.ByAccount[0].TotalTokens != 165 {
+		t.Fatalf("by_account=%+v（应按 total_tokens 降序）", rep.ByAccount)
+	}
+	if len(rep.ByModel) != 2 || rep.ByModel[0].Key != "GLM-5.2" {
+		t.Fatalf("by_model=%+v", rep.ByModel)
+	}
+
+	s.flush()
+	s2 := newUsageStore(path)
+	s2.now = s.now
+	if got := s2.snapshot(7).Total.TotalTokens; got != 175 {
+		t.Fatalf("重新加载后 total=%d，want 175", got)
+	}
+}
+
+// 时间窗口：days 只统计最近 N 天（含今天）。
+func TestUsageStoreWindow(t *testing.T) {
+	s := newUsageStore(filepath.Join(t.TempDir(), "usage.json"))
+	day := time.Date(2026, 11, 4, 12, 0, 0, 0, time.Local)
+	s.now = func() time.Time { return day }
+	s.add("a", "m", usageCounts{Requests: 1, TotalTokens: 100})
+	s.now = func() time.Time { return day.AddDate(0, 0, -10) }
+	s.add("a", "m", usageCounts{Requests: 1, TotalTokens: 900})
+	s.now = func() time.Time { return day }
+
+	if got := s.snapshot(7).Total.TotalTokens; got != 100 {
+		t.Fatalf("7 天窗口=%d，want 100（10 天前的不算）", got)
+	}
+	if got := s.snapshot(30).Total.TotalTokens; got != 1000 {
+		t.Fatalf("30 天窗口=%d，want 1000", got)
+	}
+}
+
+// 上游 usage 的字段解析：float64 / int 两种来源都要吃得下。
+func TestUsageCountsFromMap(t *testing.T) {
+	c := usageCountsFromMap(map[string]any{
+		"prompt_tokens": float64(12), "completion_tokens": float64(34), "total_tokens": float64(46),
+		"completion_tokens_details": map[string]any{"reasoning_tokens": float64(20)},
+	})
+	if c.PromptTokens != 12 || c.CompletionTokens != 34 || c.TotalTokens != 46 || c.ReasoningTokens != 20 {
+		t.Fatalf("counts=%+v", c)
+	}
+	if c := usageCountsFromMap(map[string]any{"prompt_tokens": 5, "completion_tokens": 6}); c.TotalTokens != 11 {
+		t.Fatalf("缺 total 时应相加，got %d", c.TotalTokens)
+	}
+}
+

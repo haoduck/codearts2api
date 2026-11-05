@@ -19,6 +19,9 @@ import (
 )
 
 func main() {
+	// 先把日志镜像进内存缓冲，后面所有 log.Printf 才能被面板看到。
+	server.InstallLogTee()
+
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
@@ -73,6 +76,7 @@ func main() {
 		}(),
 		QueueMaxAttempts: cfg.QueueMaxAttempts,
 		ConvStateFile:    cfg.StateFile + ".chats.json",
+		UsageFile:        cfg.StateFile + ".usage.json",
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
 			"credits_auto_claim":   cfg.CreditsAutoClaim,

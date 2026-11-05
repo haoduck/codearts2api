@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,13 @@ import (
 func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
 	total, healthy, disabled, cooling, credits := h.cfg.Pool.Stats()
 	models := h.modelList()
+	// 累计领取积分（不是余额：余额接口 tokens/balance 被上游关闭，error_code=4000）。
+	var claimedCredits float64
+	for _, st := range h.cfg.Pool.List() {
+		if v, ok := st["claimed_credits"].(float64); ok {
+			claimedCredits += v
+		}
+	}
 	ids := make([]map[string]any, 0, len(models))
 	for _, m := range models {
 		ids = append(ids, map[string]any{"id": m["id"]})
@@ -24,11 +32,12 @@ func (h *Handler) adminOverview(w http.ResponseWriter, r *http.Request) {
 		"service": "codearts2api",
 		"region":  "cn",
 		"stats": map[string]any{
-			"total":    total,
-			"healthy":  healthy,
-			"disabled": disabled,
-			"cooling":  cooling,
-			"credits":  credits,
+			"total":           total,
+			"healthy":         healthy,
+			"disabled":        disabled,
+			"cooling":         cooling,
+			"credits":         credits,
+			"claimed_credits": claimedCredits,
 		},
 		"accounts": h.cfg.Pool.List(),
 		"models":   ids,
@@ -247,6 +256,64 @@ func (h *Handler) pickTargets(uid string) []string {
 		}
 	}
 	return out
+}
+
+// adminLogs 返回最近的运行日志（游标增量拉取，供面板「运行日志」卡片使用）。
+//
+// GET /admin/api/logs?after=<seq>&limit=<n>
+//   - after 缺省/0：返回最新的 limit 行（面板首次打开即看到最近的日志）
+//   - after>0：只返回游标之后的新行，next 带回下次请求的游标
+func (h *Handler) adminLogs(w http.ResponseWriter, r *http.Request) {
+	var after uint64
+	if v := r.URL.Query().Get("after"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			after = n
+		}
+	}
+	limit := 300
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= logRingCapacity {
+			limit = n
+		}
+	}
+	lines, next := logSink.snapshot(after, limit)
+	if lines == nil {
+		lines = []logEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"lines":    lines,
+		"next":     next,
+		"capacity": logRingCapacity,
+	})
+}
+
+// adminUsage 返回代理侧 token 用量统计（总量 + 每账号 + 每模型 + 每天）。
+//
+// GET /admin/api/usage?days=7（1~30，默认 7）
+//
+// 注意：这是本代理看到的 token 数，不是上游积分余额。CodeArts 的积分换算比例
+// 未公开，且余额接口 tokens/balance 自 2026-10-22 起被上游关闭（error_code=4000）。
+func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
+	days := 7
+	if v := r.URL.Query().Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= usageRetentionDays {
+			days = n
+		}
+	}
+	rep := h.usage.snapshot(days)
+	// 补账号昵称，面板直接显示人名而不是 uid。
+	names := map[string]string{}
+	for _, st := range h.cfg.Pool.List() {
+		uid, _ := st["uid"].(string)
+		nick, _ := st["nickname"].(string)
+		if uid != "" {
+			names[uid] = nick
+		}
+	}
+	for i := range rep.ByAccount {
+		rep.ByAccount[i].Nickname = names[rep.ByAccount[i].Key]
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func allOK(results []actionResult) bool {
