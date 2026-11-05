@@ -40,6 +40,9 @@ export CA2A_API_KEY=你的随机密钥
 ./bin/codearts2api -config config.json
 ```
 
+> **Windows**：`make windows` 生成 `bin\*.exe`，然后直接双击 **`start.bat`**（启动）或 **`login.bat`**（登录）。
+> 两个脚本都会从 `.env` 读取 `CA2A_API_KEY`，并在 `bin\` 缺失时自动编译（`bin/` 不入库）。
+
 ### 验证 + WebUI
 
 ```bash
