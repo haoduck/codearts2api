@@ -107,7 +107,64 @@ input{font:inherit}
   *{animation:none!important;transition:none!important}
   .btn:hover{transform:none}
 }
+
+/* ---------- 黑夜模式（html[data-theme="dark"]） ----------
+   浅色主题的规则保持不动，这里只做覆盖，避免影响白天模式。 */
+html[data-theme="dark"]{color-scheme:dark;
+  --text:#E2E8F0; --muted:#94A3B8; --line:rgba(148,163,184,.22);
+  --card:rgba(23,33,52,.72); --card2:rgba(20,29,46,.94);
+  --shadow:0 8px 24px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.05);
+  --shadow-lg:0 16px 40px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);
+}
+html[data-theme="dark"] body{
+  background:
+    radial-gradient(900px 480px at 8% -8%, rgba(30,64,175,.30), transparent),
+    radial-gradient(820px 440px at 96% 2%, rgba(76,29,149,.28), transparent),
+    radial-gradient(760px 420px at 55% 112%, rgba(8,145,178,.20), transparent),
+    linear-gradient(180deg,#0B1220,#070C16);
+}
+html[data-theme="dark"] a{color:color-mix(in srgb,var(--accent) 80%,#E2E8F0)}
+html[data-theme="dark"] .brand h1,
+html[data-theme="dark"] .stat .v,
+html[data-theme="dark"] .card-h h2,
+html[data-theme="dark"] .login-box h1,
+html[data-theme="dark"] .modal-h h3,
+html[data-theme="dark"] .steps b{color:#F1F5F9}
+html[data-theme="dark"] .stat,
+html[data-theme="dark"] .card,
+html[data-theme="dark"] .login-box,
+html[data-theme="dark"] .modal,
+html[data-theme="dark"] .toast{border-color:rgba(148,163,184,.16)}
+html[data-theme="dark"] .card-h{background:rgba(255,255,255,.04)}
+html[data-theme="dark"] .btn{background:rgba(30,41,59,.86);color:#CBD5E1;border-color:rgba(148,163,184,.24)}
+html[data-theme="dark"] .btn:hover{background:#243044}
+html[data-theme="dark"] .btn.ghost{background:transparent}
+html[data-theme="dark"] .btn.danger{color:#F87171}
+html[data-theme="dark"] .btn.danger:hover{background:color-mix(in srgb,var(--bad) 16%,#1E293B)}
+html[data-theme="dark"] .table tbody tr:hover td{background:rgba(148,163,184,.10)}
+html[data-theme="dark"] .chip,
+html[data-theme="dark"] .field input,
+html[data-theme="dark"] .urlbox{background:rgba(15,23,42,.72);border-color:rgba(148,163,184,.22)}
+html[data-theme="dark"] .toast{background:rgba(15,23,42,.95)}
+html[data-theme="dark"] .modal-mask{background:rgba(2,6,23,.66)}
+html[data-theme="dark"] .badge.ok{color:#4ADE80;background:rgba(22,163,74,.16);border-color:rgba(22,163,74,.32)}
+html[data-theme="dark"] .badge.warn{color:#FBBF24;background:rgba(217,119,6,.16);border-color:rgba(217,119,6,.32)}
+html[data-theme="dark"] .badge.bad{color:#F87171;background:rgba(220,38,38,.16);border-color:rgba(220,38,38,.32)}
+html[data-theme="dark"] .badge.info{color:#38BDF8;background:rgba(2,132,199,.16);border-color:rgba(2,132,199,.32)}
+html[data-theme="dark"] ::-webkit-scrollbar-thumb{background:rgba(148,163,184,.28)}
+html[data-theme="dark"] #logView{background:rgba(0,0,0,.5)!important}
 </style>
+<script>
+// 主题要在首屏渲染前定好，否则会先闪一下浅色（脚本放在 body 末尾就来不及）。
+(function () {
+  try {
+    var saved = localStorage.getItem("__SERVICE_NAME___theme");
+    var dark = saved ? saved === "dark"
+      : !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  } catch (e) {}
+})();
+</script>
 
 
 </head>
@@ -146,6 +203,7 @@ input{font:inherit}
       <button class="btn" id="btnCheckin">全员签到</button>
       <button class="btn" id="btnKeepalive">保活 Token</button>
       <button class="btn" id="btnReload">重载 auths</button>
+      <button class="btn ghost" id="btnTheme" title="切换黑夜/白天模式">🌙</button>
       <button class="btn ghost" id="btnLogout">退出</button>
     </div>
   </div>
@@ -194,6 +252,38 @@ input{font:inherit}
         <span>OpenAI base: <span class="mono" id="baseUrl"></span></span>
         <span>API: <span class="mono">/v1/chat/completions</span></span>
       </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">
+      <h2>用量统计</h2>
+      <span class="muted" id="usageHint">最近 7 天 · 代理侧 token 计数（非上游积分）</span>
+    </div>
+    <div class="card-b">
+      <div class="chips" id="usageChips"></div>
+      <div style="overflow-x:auto;margin-top:10px">
+        <table class="table" id="usageTable">
+          <thead>
+            <tr><th>账号</th><th>请求</th><th>prompt</th><th>completion</th><th>合计 token</th></tr>
+          </thead>
+          <tbody id="usageBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">
+      <h2>运行日志</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="muted" id="logState">已暂停</span>
+        <button class="btn" id="btnLogToggle">开始</button>
+        <button class="btn" id="btnLogClear">清屏</button>
+      </div>
+    </div>
+    <div class="card-b" style="padding:0">
+      <pre id="logView" class="mono" style="margin:0;padding:12px;max-height:340px;overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;background:rgba(0,0,0,.28);border-radius:0 0 12px 12px">（点「开始」实时拉取服务端日志；服务端只保留最近 1000 行，重启后清空）</pre>
     </div>
   </div>
 </div>
@@ -299,7 +389,10 @@ function render(data){
   $("sTotal").textContent = st.total ?? 0;
   $("sHealthy").textContent = st.healthy ?? 0;
   $("sBad").textContent = `${st.cooling??0} / ${st.disabled??0}`;
-  $("sCredits").textContent = data.schedule?.watch?.enabled && data.schedule?.watch?.credits_auto_claim ? "已开启" : "已关闭";
+  const claimed = Number(st.claimed_credits || 0);
+  const creditsOn = data.schedule?.watch?.enabled && data.schedule?.watch?.credits_auto_claim;
+  $("sCredits").textContent = (creditsOn ? "已开启" : "已关闭") +
+    (claimed > 0 ? ` · 累计 ${claimed.toLocaleString()} 积分` : "");
   $("updatedAt").textContent = "更新于 " + new Date().toLocaleTimeString();
   $("baseUrl").textContent = location.origin + BASE + "/v1";
   $("subTitle").textContent = (data.service || SERVICE) + " · " + (data.region || "cn");
@@ -317,7 +410,7 @@ function render(data){
           <div><strong>${escapeHtml(a.nickname || "未命名")}</strong></div>
           <div class="mono muted" title="${escapeHtml(a.uid||"")}">${escapeHtml(shortUID(a.uid))}</div>
         </td>
-        <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div></td>
+        <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div>${Number(a.claimed_credits||0) > 0 ? `<div class="muted" style="font-size:11px">累计已领 ${Number(a.claimed_credits).toLocaleString()} 积分</div>` : ""}</td>
         <td>${statusBadge(a)}${a.err_count?` <span class="badge info">err ${a.err_count}</span>`:""}</td>
         <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(until)}</div></td>
         <td><div class="row-actions">
@@ -362,6 +455,7 @@ async function showApp(){
   $("appView").classList.remove("hidden");
   try {
     await loadOverview();
+    loadUsage();
   } catch (e) {
     toast("登录失败: " + e.message, false);
     clearKey();
@@ -383,8 +477,26 @@ $("loginBtn").onclick = async () => {
 };
 $("keyInput").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
 $("btnLogout").onclick = () => { clearKey(); showLogin(); toast("已退出"); };
+
+/* ---------- 主题（黑夜/白天） ---------- */
+const THEME_STORE = SERVICE + "_theme";
+function applyTheme(t, persist){
+  document.documentElement.setAttribute("data-theme", t);
+  if (persist) { try { localStorage.setItem(THEME_STORE, t); } catch(e){} }
+  const b = $("btnTheme");
+  if (b){
+    b.textContent = t === "dark" ? "☀️" : "🌙";
+    b.title = t === "dark" ? "切换到白天模式" : "切换到黑夜模式";
+  }
+}
+$("btnTheme").onclick = () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  applyTheme(next, true);
+};
+// 只同步图标，不覆盖用户/系统的选择
+applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light", false);
 $("btnRefresh").onclick = async () => {
-  try { await loadOverview(); toast("已刷新"); } catch(e){ toast(e.message,false); }
+  try { await loadOverview(); loadUsage(); toast("已刷新"); } catch(e){ toast(e.message,false); }
 };
 
 async function runAction(path, body){
@@ -571,6 +683,82 @@ $("oauthCopy").onclick = async () => {
     try { document.execCommand("copy"); toast("已复制授权链接"); } catch(e){ toast("复制失败", false); }
     ta.remove();
   }
+};
+
+/* ---------- 用量统计 ---------- */
+async function loadUsage(){
+  try {
+    const u = await api("/admin/api/usage?days=7");
+    const fmt = (n) => Number(n||0).toLocaleString();
+    const chips = [
+      `总请求 <b>${fmt(u.total?.requests)}</b>`,
+      `总 token <b>${fmt(u.total?.total_tokens)}</b>`,
+      `今日请求 <b>${fmt(u.today?.requests)}</b>`,
+      `今日 token <b>${fmt(u.today?.total_tokens)}</b>`,
+    ];
+    if (u.total?.reasoning_tokens) chips.push(`推理 token <b>${fmt(u.total.reasoning_tokens)}</b>`);
+    $("usageChips").innerHTML = chips.map(t => `<span class="chip">${t}</span>`).join("");
+
+    const rows = u.by_account || [];
+    $("usageBody").innerHTML = rows.length
+      ? rows.map(r => `<tr>
+          <td>${escapeHtml(r.nickname || shortUID(r.key))}<div class="mono muted" style="font-size:11px">${escapeHtml(r.key)}</div></td>
+          <td class="mono">${fmt(r.requests)}</td>
+          <td class="mono">${fmt(r.prompt_tokens)}</td>
+          <td class="mono">${fmt(r.completion_tokens)}</td>
+          <td class="mono">${fmt(r.total_tokens)}</td>
+        </tr>`).join("")
+      : `<tr><td colspan="5" class="empty">暂无用量（重启后开始统计）</td></tr>`;
+
+    const models = (u.by_model || []).slice(0, 8);
+    if (models.length) {
+      $("usageHint").textContent = `最近 7 天 · 代理侧 token 计数 · 模型：` +
+        models.map(m => `${m.key} ${fmt(m.total_tokens)}`).join(" / ");
+    }
+  } catch (e) {
+    // 用量卡片静默失败，不影响其它操作
+  }
+}
+
+/* ---------- 运行日志（增量拉取 /admin/api/logs） ---------- */
+let logCursor = 0;
+let logTimer = null;
+let logPaused = true;
+let logLines = [];
+
+async function pullLogs(){
+  if (logPaused) return;
+  try {
+    const data = await api(`/admin/api/logs?after=${logCursor}&limit=300`);
+    const lines = data.lines || [];
+    if (lines.length){
+      logLines.push(...lines.map(l => l.line));
+      if (logLines.length > 1000) logLines = logLines.slice(-800);
+      const box = $("logView");
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 12;
+      box.textContent = logLines.join("\n");
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+    if (typeof data.next === "number") logCursor = data.next;
+  } catch (e) {
+    // 日志面板静默失败：不能因为它弹 toast 打断别的操作。
+  }
+}
+
+$("btnLogToggle").onclick = () => {
+  logPaused = !logPaused;
+  $("btnLogToggle").textContent = logPaused ? "开始" : "暂停";
+  $("logState").textContent = logPaused ? "已暂停" : "实时（2s）";
+  if (logPaused) {
+    if (logTimer) { clearInterval(logTimer); logTimer = null; }
+    return;
+  }
+  pullLogs();
+  logTimer = setInterval(pullLogs, 2000);
+};
+$("btnLogClear").onclick = () => {
+  logLines = [];
+  $("logView").textContent = "";
 };
 
 // 经由 hub 反代时 hub 会自动注入服务 api_key，直接尝试加载；
