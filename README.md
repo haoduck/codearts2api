@@ -40,8 +40,8 @@ export CA2A_API_KEY=你的随机密钥
 ./bin/codearts2api -config config.json
 ```
 
-> **Windows**：`make windows` 生成 `bin\*.exe`，然后直接双击 **`start.bat`**（启动）或 **`login.bat`**（登录）。
-> 两个脚本都会从 `.env` 读取 `CA2A_API_KEY`，并在 `bin\` 缺失时自动编译（`bin/` 不入库）。
+> **Windows**：仓库里已带 `bin\*.exe`（当前版本，无需 Go 环境），直接双击 **`start.bat`**（启动）
+> 或 **`login.bat`**（登录）。两个脚本都会从 `.env` 读取 `CA2A_API_KEY`；想自己重新编译用 `make windows`。
 
 ### 验证 + WebUI
 

@@ -1,6 +1,6 @@
 auths/
 data/
-bin/
+bin/*
 config.json
 .env
 *.key
@@ -16,3 +16,7 @@ config.json
 !.vscode/launch.json
 !.vscode/tasks.json
 !.vscode/extensions.json
+
+# bin/ 下的 Windows 可执行文件要入库（新电脑没有 Go 环境也能直接用，见 README）。
+# git 以「最后匹配的规则」为准，所以这条取反必须放在上面的 *.exe 之后。
+!bin/*.exe
