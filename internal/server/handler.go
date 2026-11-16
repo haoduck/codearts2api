@@ -115,6 +115,8 @@ type Handler struct {
 	convGen map[string]uint64
 	// usage 代理侧 token 用量统计（按 天×账号×模型 聚合）。
 	usage *usageStore
+	// catalogInflight 后台补模型目录的单飞表（account uid → 正在拉取）。
+	catalogInflight sync.Map
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
@@ -659,6 +661,9 @@ func (h *Handler) acquireSlot(skip map[string]bool, model string) *pool.Account 
 			continue
 		}
 		if h.cfg.Pool.AcquireLock(acct.Name) {
+			// 选中就顺手在后台补一次目录：目录未知时选号是乐观放行的，
+			// 补上之后后续选号更准，不会白轮转到没有该模型的账号。
+			h.ensureCatalogAsync(acct)
 			return acct
 		}
 	}
@@ -669,6 +674,28 @@ func (h *Handler) acquireSlot(skip map[string]bool, model string) *pool.Account 
 //
 // 只在聊天挑号失败时调用（不是热路径），且有 CatalogTTL 与失败退避兜底：
 // 刚发现过的账号不会被重复打，上游某一路挂了也不会每次请求都空等超时。
+// ensureCatalogAsync 在后台补一次该账号的模型目录（不阻塞请求、单飞）。
+//
+// 对照 workbuddy2api-hub 的 ensure_models(acct)：目录过期时聊天前补一次。
+// 这里改成异步，避免把 8s 的发现延迟加到热路径上。
+func (h *Handler) ensureCatalogAsync(acct *pool.Account) {
+	if acct == nil || acct.Auth == nil || h.cfg.Upstream == nil {
+		return
+	}
+	if !upstream.AccountCatalogStale(acct.UID) {
+		return
+	}
+	if _, loaded := h.catalogInflight.LoadOrStore(acct.UID, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer h.catalogInflight.Delete(acct.UID)
+		if _, err := h.cfg.Upstream.FetchModels(acct.Auth); err != nil {
+			log.Printf("lazy model discovery failed account=%s: %v", acct.Name, err)
+		}
+	}()
+}
+
 func (h *Handler) discoverMissingCatalogs(tried map[string]bool) {
 	for _, acct := range h.cfg.Pool.Accounts() {
 		if acct == nil || acct.Auth == nil || tried[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
@@ -786,6 +813,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Model != "" && req.Model != "auto" {
 		model = req.Model
 	}
+	// reasoning_effort 按模型校验：非法档位直接 400，别让上游把它判成账号故障。
+	effort, eerr := upstream.NormalizeReasoningEffort(model, req.ReasoningEffort)
+	if eerr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", eerr.Error())
+		return
+	}
 
 	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息
 	// 为整条 Agent 工具链固定 CodeArts 内置 chat_id 与账号亲和。V2 接口
@@ -863,7 +896,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		cred := credentialOf(acct)
 		chatOpts := upstream.ChatOptions{
-			ReasoningEffort: req.ReasoningEffort,
+			ReasoningEffort: effort,
 			MaxTokens:       req.MaxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
@@ -932,11 +965,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
-				// 没有别的账号可换（都忙/都不支持该模型）：原地等这个账号释放。
+				// 上游排队是瞬时的：先快后慢。前两次用 2s / 4s（对齐 CodeArts
+				// Agent IDE 的快重试），但不超过配置的 QueueRetryDelay；
+				// 之后按配置走。
+				wait := h.cfg.QueueRetryDelay
+				if retry < 2 {
+					if ramp := time.Duration(2*(retry+1)) * time.Second; ramp < wait {
+						wait = ramp
+					}
+				}
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s",
-					retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
+					retry+1, h.cfg.QueueMaxAttempts, acct.Name, wait)
 				select {
-				case <-time.After(h.cfg.QueueRetryDelay):
+				case <-time.After(wait):
 				case <-r.Context().Done():
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
@@ -1091,9 +1132,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
 func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessage {
 	_ = toolsOn // 保留参数以稳定内部调用面；工具 schema 由 ChatOptions 原生传递。
-	keepCalls, keepResults := pairedToolMessages(req.Messages)
-	out := make([]upstream.ChatMessage, 0, len(req.Messages))
-	for i, m := range req.Messages {
+	// 先归一历史形状（developer→system、合并相邻 tool_calls、重排插队消息），
+	// 再按「成对」规则裁掉孤儿工具调用。
+	msgs := normalizeUpstreamMessages(req.Messages)
+	keepCalls, keepResults := pairedToolMessages(msgs)
+	out := make([]upstream.ChatMessage, 0, len(msgs))
+	for i, m := range msgs {
 		switch m.Role {
 		case "system", "user":
 			// 含图片时用结构化 content（text + image_url 数组），否则保持纯字符串。
@@ -1102,6 +1146,9 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 				content = m.Parts
 			}
 			out = append(out, upstream.ChatMessage{Role: m.Role, Content: content})
+		case "developer":
+			// normalizeUpstreamMessages 已把它改成 system；这里兜底，避免丢消息。
+			out = append(out, upstream.ChatMessage{Role: "system", Content: m.Text})
 		case "assistant":
 			reasoning := m.ReasoningContent
 			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
@@ -1172,24 +1219,32 @@ func pairedToolMessages(messages []openAIMessage) (map[int]bool, map[int]bool) {
 // nativeTools preserves a named function choice by exposing only that function
 // to the upstream, whose tool_choice accepts strings but not a named object.
 func nativeTools(tools []map[string]any, choice toolChoiceOpenAI) ([]map[string]any, error) {
+	if choice.Mode == "function" {
+		// 指定工具在**原始**清单里重复 → 无法判断该用哪份 schema，直接 400。
+		// 这一步必须先于 normalizeToolDefs，否则去重会把它悄悄合并掉。
+		count := 0
+		for _, tool := range tools {
+			fn, ok := tool["function"].(map[string]any)
+			if ok && fn["name"] == choice.Function {
+				count++
+			}
+		}
+		if count > 1 {
+			return nil, fmt.Errorf("tool_choice function %q is defined more than once", choice.Function)
+		}
+	}
+	// 修成上游能接受的 schema（缺 function 对象/非法名字的条目会被丢掉）。
+	tools = normalizeToolDefs(tools)
 	if choice.Mode != "function" {
 		return tools, nil
 	}
-	var selected map[string]any
 	for _, tool := range tools {
 		fn, ok := tool["function"].(map[string]any)
-		if !ok || fn["name"] != choice.Function {
-			continue
+		if ok && fn["name"] == choice.Function {
+			return []map[string]any{tool}, nil
 		}
-		if selected != nil {
-			return nil, fmt.Errorf("tool_choice function %q is defined more than once", choice.Function)
-		}
-		selected = tool
 	}
-	if selected == nil {
-		return nil, fmt.Errorf("tool_choice function %q is not defined in tools", choice.Function)
-	}
-	return []map[string]any{selected}, nil
+	return nil, fmt.Errorf("tool_choice function %q is not defined in tools", choice.Function)
 }
 
 func nativeToolChoice(choice toolChoiceOpenAI) any {

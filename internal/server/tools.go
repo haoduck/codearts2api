@@ -15,6 +15,152 @@ import (
 	"strings"
 )
 
+// normalizeToolDefs 把客户端工具声明修成上游严格校验能接受的形状。
+//
+// 对照 workbuddy2api-hub 的 normalize_tools / _normalize_tool_parameters：
+// 上游的 Go 校验器要求 function.name 匹配 ^[A-Za-z0-9_-]{1,64}$、
+// function.parameters 为 type=object 且带 properties；不满足就整条请求 400
+// （Tool function cannot empty / tools[N].function.name），换账号也没用。
+//
+// 只修复、不重命名：改名会让模型吐出的 tool_calls 名字和客户端认知对不上。
+// 无法满足 schema 的条目直接丢弃（裸的服务端工具如 {"type":"web_search"}）。
+func normalizeToolDefs(tools []map[string]any) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(tools))
+	seen := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		var fn map[string]any
+		if existing, ok := t["function"].(map[string]any); ok && existing != nil {
+			// 复制一份，避免改动调用方数据
+			fn = make(map[string]any, len(existing)+1)
+			for k, v := range existing {
+				fn[k] = v
+			}
+		} else if name, ok := t["name"].(string); ok {
+			// 顶层 name/description/parameters 形态（部分客户端这么发）
+			fn = map[string]any{
+				"name":        name,
+				"description": t["description"],
+				"parameters":  t["parameters"],
+			}
+			if s, ok := t["strict"].(bool); ok {
+				fn["strict"] = s
+			}
+		} else {
+			// {"type":"web_search"} 这类裸声明：补不出 function 对象，只能丢。
+			continue
+		}
+		name, _ := fn["name"].(string)
+		name = strings.TrimSpace(name)
+		if !validToolName(name) || seen[name] {
+			continue
+		}
+		seen[name] = true
+		normalizeToolParameters(fn)
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// validToolName 上游只接受 ^[A-Za-z0-9_-]{1,64}$。
+func validToolName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeToolParameters 保证 parameters 是 type=object + properties 的合法 schema。
+func normalizeToolParameters(fn map[string]any) {
+	params, ok := fn["parameters"].(map[string]any)
+	if !ok || params == nil {
+		fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		return
+	}
+	params["type"] = "object"
+	if props, ok := params["properties"].(map[string]any); !ok || props == nil {
+		params["properties"] = map[string]any{}
+	}
+	normalizeSchemaNode(params)
+}
+
+// normalizeSchemaNode 递归修 JSON Schema：类型别名改标准类型、required 去掉
+// 非字符串、description/title 的 null 去掉。
+func normalizeSchemaNode(node map[string]any) {
+	if t, ok := node["type"].(string); ok {
+		if fixed, changed := schemaTypeAlias(t); changed {
+			node["type"] = fixed
+		}
+	}
+	if req, ok := node["required"].([]any); ok {
+		kept := make([]any, 0, len(req))
+		for _, v := range req {
+			if s, ok := v.(string); ok && s != "" {
+				kept = append(kept, s)
+			}
+		}
+		node["required"] = kept
+	}
+	for _, key := range []string{"description", "title"} {
+		if v, ok := node[key]; ok && v == nil {
+			delete(node, key)
+		}
+	}
+	if props, ok := node["properties"].(map[string]any); ok {
+		for _, v := range props {
+			if child, ok := v.(map[string]any); ok {
+				normalizeSchemaNode(child)
+			}
+		}
+	}
+	if items, ok := node["items"].(map[string]any); ok {
+		normalizeSchemaNode(items)
+	}
+	for _, key := range []string{"$defs", "definitions"} {
+		if defs, ok := node[key].(map[string]any); ok {
+			for _, v := range defs {
+				if child, ok := v.(map[string]any); ok {
+					normalizeSchemaNode(child)
+				}
+			}
+		}
+	}
+}
+
+// schemaTypeAlias 把常见类型别名映射成 JSON Schema 标准类型。
+func schemaTypeAlias(t string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "str":
+		return "string", true
+	case "int":
+		return "integer", true
+	case "float":
+		return "number", true
+	case "bool":
+		return "boolean", true
+	case "dict":
+		return "object", true
+	case "list":
+		return "array", true
+	}
+	return t, false
+}
+
 // toolSpec 归一化后的工具定义。
 type toolSpec struct {
 	Name        string
