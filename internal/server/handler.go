@@ -957,6 +957,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
+				log.Printf("upstream rejected request params account=%s: %s",
+					acct.Name, truncateMsg(serr.Error(), 200))
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(serr.Error(), 200))
 				return
@@ -1034,6 +1036,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 		if aerr != nil {
 			if isParamInvalidError(aerr) {
+				log.Printf("upstream rejected request params account=%s: %s",
+					acct.Name, truncateMsg(aerr.Error(), 200))
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
 				return
@@ -1092,7 +1096,12 @@ func buildUpstreamMessages(req *chatRequest, toolsOn bool) []upstream.ChatMessag
 	for i, m := range req.Messages {
 		switch m.Role {
 		case "system", "user":
-			out = append(out, upstream.ChatMessage{Role: m.Role, Content: m.Text})
+			// 含图片时用结构化 content（text + image_url 数组），否则保持纯字符串。
+			content := any(m.Text)
+			if len(m.Parts) > 0 {
+				content = m.Parts
+			}
+			out = append(out, upstream.ChatMessage{Role: m.Role, Content: content})
 		case "assistant":
 			reasoning := m.ReasoningContent
 			wire := upstream.ChatMessage{Role: "assistant", Content: m.Text, ReasoningContent: &reasoning}
@@ -1328,7 +1337,15 @@ func isParamInvalidError(err error) bool {
 		return false
 	}
 	low := strings.ToLower(message)
-	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
+	if strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid") {
+		return true
+	}
+	// 客户端把图片发给非多模态模型、或工具声明缺 function 对象：都是请求形状问题，
+	// 换账号/冷却都没用（对照 workbuddy2api-hub 的 _raise_embedded 分类）。
+	if strings.Contains(low, "not multimodal") || strings.Contains(low, "tool function cannot empty") {
+		return true
+	}
+	return false
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。

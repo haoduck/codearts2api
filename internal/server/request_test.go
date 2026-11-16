@@ -330,7 +330,6 @@ func TestParseChatRequestRejectsEmptyUserContent(t *testing.T) {
 	for _, body := range []string{
 		`{"messages":[{"role":"user","content":""}]}`,
 		`{"messages":[{"role":"user","content":"   "}]}`,
-		`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:x"}}]}]}`,
 	} {
 		_, err := parseChatRequest([]byte(body))
 		if err == nil {
@@ -434,6 +433,66 @@ func TestParseChatRequestOmitsSamplingFields(t *testing.T) {
 	if len(req.Stop) != 0 || req.FrequencyPenalty != nil || req.PresencePenalty != nil ||
 		req.Seed != nil || req.TopK != nil || req.ParallelToolCalls != nil || req.ResponseFormat != nil {
 		t.Fatalf("未提供的采样参数不应有值: %+v", req)
+	}
+}
+
+
+// 图片分片要保留成上游认识的 image_url（OpenAI / Responses / Anthropic 三种形状）。
+func TestParseChatRequestKeepsImageParts(t *testing.T) {
+	cases := []struct{ name, content, wantURL string }{
+		{"openai object", `[{"type":"image_url","image_url":{"url":"https://x/a.png","detail":"low"}}]`, "https://x/a.png"},
+		{"openai string", `[{"type":"image_url","image_url":"data:image/png;base64,AAA"}]`, "data:image/png;base64,AAA"},
+		{"responses input_image", `[{"type":"input_image","image_url":"https://x/b.png"}]`, "https://x/b.png"},
+		{"anthropic base64", `[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"ZZZ"}}]`, "data:image/jpeg;base64,ZZZ"},
+		{"anthropic url", `[{"type":"image","source":{"type":"url","url":"https://x/c.png"}}]`, "https://x/c.png"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":` + c.content + `}]}`))
+			if err != nil {
+				t.Fatalf("含图片的消息不应被拒: %v", err)
+			}
+			if len(req.Messages) != 1 || len(req.Messages[0].Parts) == 0 {
+				t.Fatalf("图片分片丢失: %+v", req.Messages)
+			}
+			img, _ := req.Messages[0].Parts[0].(map[string]any)
+			inner, _ := img["image_url"].(map[string]any)
+			if inner["url"] != c.wantURL {
+				t.Fatalf("url=%v，want %s（parts=%+v）", inner["url"], c.wantURL, req.Messages[0].Parts)
+			}
+		})
+	}
+}
+
+// 文本 + 图片：文本进 text 分片，图片跟在后面。
+func TestParseChatRequestTextPlusImage(t *testing.T) {
+	req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"这是什么"},
+		{"type":"image_url","image_url":{"url":"https://x/a.png"}}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := req.Messages[0].Parts
+	if len(parts) != 2 {
+		t.Fatalf("parts=%+v，want 2（text + image_url）", parts)
+	}
+	first, _ := parts[0].(map[string]any)
+	if first["type"] != "text" || first["text"] != "这是什么" {
+		t.Fatalf("第一个分片应为文本: %+v", first)
+	}
+	if req.Messages[0].Text != "这是什么" {
+		t.Fatalf("Text=%q", req.Messages[0].Text)
+	}
+}
+
+// 纯文本消息不带 Parts（保持原有线格式，不影响老客户端）。
+func TestParseChatRequestTextOnlyHasNoParts(t *testing.T) {
+	req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Messages[0].Parts != nil {
+		t.Fatalf("纯文本不应生成 Parts: %+v", req.Messages[0].Parts)
 	}
 }
 

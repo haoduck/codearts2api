@@ -27,6 +27,7 @@ type openAIToolCall struct {
 type openAIMessage struct {
 	Role             string
 	Text             string
+	Parts            []any // 含图片时的结构化 content（text + image_url），nil 表示纯文本
 	ReasoningContent string
 	ToolCalls        []openAIToolCall
 	ToolCallID       string // role=tool 时对应的 call id
@@ -139,7 +140,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("messages[%d]: %w", i, err)
 		}
-		if m.Role == "user" && strings.TrimSpace(m.Text) == "" && len(rm) > 0 {
+		if m.Role == "user" && strings.TrimSpace(m.Text) == "" && len(m.Parts) == 0 && len(rm) > 0 {
 			// 能读的字段都读不出来：把原始片段打出来，便于定位客户端到底把
 			// 文本放哪了（这是「模型只回一句问候语」这类现象的唯一线索）。
 			log.Printf("request: messages[%d] role=user content 解析为空 raw=%s", i, truncateMsg(string(rm), 240))
@@ -153,7 +154,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		switch m.Role {
 		case "user":
 			hasUser = true
-			if strings.TrimSpace(m.Text) != "" {
+			if strings.TrimSpace(m.Text) != "" || len(m.Parts) > 0 {
 				hasSendable = true
 			}
 		case "tool":
@@ -189,6 +190,15 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 		ReasoningContent: probe.ReasoningContent,
 		ToolCallID:       probe.ToolCallID,
 		Name:             probe.Name,
+	}
+	// 含图片时保留结构化 content（上游接受 text + image_url 数组，但只对
+	// 多模态模型有效；非多模态模型会回 406 The request model is not multimodal）。
+	if imgs := imageParts(probe.Content); len(imgs) > 0 {
+		parts := make([]any, 0, len(imgs)+1)
+		if strings.TrimSpace(m.Text) != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": m.Text})
+		}
+		m.Parts = append(parts, imgs...)
 	}
 	if len(probe.ToolCalls) > 0 && string(probe.ToolCalls) != "null" {
 		var calls []struct {
@@ -237,6 +247,71 @@ func flattenContent(raw json.RawMessage) string {
 		return sb.String()
 	}
 	return textFromPart(raw)
+}
+
+// imageParts 从 content 里提取图片分片，统一成上游认识的
+// {"type":"image_url","image_url":{"url":...}}；没有图片返回 nil。
+//
+// 上游 /api/v2/chat/completions 接受 OpenAI 风格 content 数组（text + image_url），
+// 但只对多模态模型生效（否则 406 The request model is not multimodal）。
+// Anthropic 的 image/source 与 Responses 的 input_image 一并归一。
+func imageParts(raw json.RawMessage) []any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var list []map[string]any
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil
+	}
+	var out []any
+	for _, p := range list {
+		typ, _ := p["type"].(string)
+		var url, detail string
+		switch typ {
+		case "image_url", "input_image":
+			switch v := p["image_url"].(type) {
+			case string:
+				url = v
+			case map[string]any:
+				url, _ = v["url"].(string)
+				detail, _ = v["detail"].(string)
+			}
+			if url == "" {
+				url, _ = p["url"].(string)
+			}
+		case "image":
+			// Anthropic: {"type":"image","source":{"type":"base64","media_type","data"}}
+			if src, ok := p["source"].(map[string]any); ok {
+				st, _ := src["type"].(string)
+				switch st {
+				case "base64":
+					media, _ := src["media_type"].(string)
+					data, _ := src["data"].(string)
+					if data != "" {
+						if media == "" {
+							media = "image/png"
+						}
+						url = "data:" + media + ";base64," + data
+					}
+				case "url":
+					url, _ = src["url"].(string)
+				}
+			}
+		default:
+			if v, ok := p["image_url"].(map[string]any); ok {
+				url, _ = v["url"].(string)
+			}
+		}
+		if url == "" {
+			continue
+		}
+		img := map[string]any{"url": url}
+		if detail != "" {
+			img["detail"] = detail
+		}
+		out = append(out, map[string]any{"type": "image_url", "image_url": img})
+	}
+	return out
 }
 
 // textFromPart 从单个 content 分片里取文本（兼容嵌套 content/value）。
