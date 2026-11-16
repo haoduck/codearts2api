@@ -15,6 +15,92 @@ import (
 	"time"
 )
 
+// signedHeadersOf 从 Authorization 头里取出 SignedHeaders 列表。
+func signedHeadersOf(authz string) string {
+	const prefix = "SignedHeaders="
+	i := strings.Index(authz, prefix)
+	if i < 0 {
+		return ""
+	}
+	rest := authz[i+len(prefix):]
+	if j := strings.Index(rest, ","); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// 会话统计头：网关按 x-ot-session-id 统计「每账号并发会话」，不发就等于每个
+// 请求一个新会话（结束后还占位约 60 秒），单账号 3 个名额很快被占满。
+func TestChatSendsOTSessionHeaders(t *testing.T) {
+	var got http.Header
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	ot := OTSessionIDFor("uid-1")
+	if ot == "" || len(ot) != 32 {
+		t.Fatalf("OTSessionIDFor 应返回 32 位十六进制，got %q", ot)
+	}
+	if again := OTSessionIDFor("uid-1"); again != ot {
+		t.Fatalf("同一账号的 ot session 必须稳定: %q vs %q", again, ot)
+	}
+	if other := OTSessionIDFor("uid-2"); other == ot {
+		t.Fatal("不同账号的 ot session 必须不同")
+	}
+
+	c := NewWithChatEndpoint(5*time.Second, srv.URL)
+	cred := SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "st"}
+	rc, err := c.ChatStreamWithOptions(context.Background(), "0123456789abcdef0123456789abcdef",
+		[]ChatMessage{{Role: "user", Content: "hi"}}, "", cred, "user", "GLM-5.2",
+		ChatOptions{OTSessionID: ot}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+
+	if got.Get("x-ot-session-id") != ot {
+		t.Fatalf("x-ot-session-id=%q，want %q", got.Get("x-ot-session-id"), ot)
+	}
+	if got.Get("user-session-id") != ot {
+		t.Fatalf("user-session-id=%q，want %q", got.Get("user-session-id"), ot)
+	}
+	if n := len(got.Get("x-ot-trace-id")); n != 32 {
+		t.Fatalf("x-ot-trace-id 应为 32 位十六进制，got %q", got.Get("x-ot-trace-id"))
+	}
+	// 签名之后追加，不能进入 SignedHeaders（否则签名对不上）
+	signed := signedHeadersOf(got.Get("Authorization"))
+	for _, key := range []string{"x-ot-session-id", "user-session-id", "x-ot-trace-id", "chat-id", "session-id"} {
+		if strings.Contains(signed, key) {
+			t.Fatalf("%s 不应进入 SignedHeaders: %s", key, signed)
+		}
+	}
+	if !strings.Contains(signed, "x-auth-token") {
+		t.Fatalf("SignedHeaders 应包含签名前设置的 x-auth-token: %s", signed)
+	}
+	if got.Get("Chat-Id") != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("Chat-Id 丢失: %q", got.Get("Chat-Id"))
+	}
+	if body["prompt_cache_key"] != "0123456789abcdef0123456789abcdef" || body["tool_stream"] != true {
+		t.Fatalf("prompt_cache_key/tool_stream 丢失: %v", body)
+	}
+}
+
+// CA2A_OT_SESSION=0 时不发会话统计头（便于对照）。
+func TestOTSessionCanBeDisabled(t *testing.T) {
+	t.Setenv("CA2A_OT_SESSION", "0")
+	if OTSessionEnabled() {
+		t.Fatal("CA2A_OT_SESSION=0 应关闭")
+	}
+	if got := OTSessionIDFor("uid-1"); got != "" {
+		t.Fatalf("关闭时不应生成 id，got %q", got)
+	}
+}
+
 type terminalErrorReader struct{ err error }
 
 func (r terminalErrorReader) Read([]byte) (int, error) { return 0, r.err }

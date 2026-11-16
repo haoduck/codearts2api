@@ -169,3 +169,26 @@ func TestModelErrorDoesNotCoolAccount(t *testing.T) {
 		t.Errorf("应记为模型不可用，got state=%v reason=%q", st, reason)
 	}
 }
+
+// 上游并发上限的错误文案不统一，中英文变体都要认（对照 workbuddy2api-hub
+// 的 _is_concurrency_message）；误判会导致该换号时不换号、或把限流当参数错误。
+func TestIsConcurrentLimitErrorVariants(t *testing.T) {
+	for _, msg := range []string{
+		"TM.00001041 并发会话数已达上限",
+		"concurrent session limit reached",
+		"Maximum number of active sessions reached",
+	} {
+		if !isConcurrentLimitError(msg) {
+			t.Errorf("%q 应判为并发上限", msg)
+		}
+	}
+	for _, msg := range []string{
+		"InferHub.ModelArts.81114.429 Too many requests",
+		"InferHub.002002009.404 The model is not registered",
+	} {
+		if isConcurrentLimitError(msg) {
+			t.Errorf("%q 不应判为并发上限", msg)
+		}
+	}
+}
+

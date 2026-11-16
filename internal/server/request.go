@@ -52,6 +52,16 @@ type chatRequest struct {
 	Tools           []map[string]any
 	ToolChoice      toolChoiceOpenAI
 	ConversationID  string
+
+	// 采样/格式类参数：上游实测接受并生效（对照 workbuddy2api-hub 的
+	// build_chat_body 记录），此前被网关静默丢弃。
+	Stop              []string
+	FrequencyPenalty  *float64
+	PresencePenalty   *float64
+	Seed              *int
+	ResponseFormat    any
+	TopK              *int
+	ParallelToolCalls *bool
 }
 
 // parseChatRequest 解析并校验请求体。
@@ -71,6 +81,13 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		Messages            []json.RawMessage `json:"messages"`
 		Tools               []map[string]any  `json:"tools"`
 		ToolChoice          json.RawMessage   `json:"tool_choice"`
+		Stop                json.RawMessage   `json:"stop"`
+		FrequencyPenalty    *float64          `json:"frequency_penalty"`
+		PresencePenalty     *float64          `json:"presence_penalty"`
+		Seed                *int              `json:"seed"`
+		ResponseFormat      json.RawMessage   `json:"response_format"`
+		TopK                *int              `json:"top_k"`
+		ParallelToolCalls   *bool             `json:"parallel_tool_calls"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse request: %w", err)
@@ -89,6 +106,14 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		ConversationID:  raw.ConversationID,
 		Tools:           raw.Tools,
 		ToolChoice:      parseToolChoice(raw.ToolChoice),
+
+		Stop:              parseStop(raw.Stop),
+		FrequencyPenalty:  raw.FrequencyPenalty,
+		PresencePenalty:   raw.PresencePenalty,
+		Seed:              raw.Seed,
+		ResponseFormat:    parseResponseFormat(raw.ResponseFormat),
+		TopK:              raw.TopK,
+		ParallelToolCalls: raw.ParallelToolCalls,
 	}
 	if raw.MaxCompletionTokens != nil {
 		req.MaxTokens = raw.MaxCompletionTokens
@@ -265,6 +290,43 @@ func rawJSONString(raw json.RawMessage) string {
 		return "{}"
 	}
 	return string(out)
+}
+
+// parseStop 归一化 stop：OpenAI 允许 string 或 []string。
+func parseStop(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		if one == "" {
+			return nil
+		}
+		return []string{one}
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		out := make([]string, 0, len(many))
+		for _, s := range many {
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// parseResponseFormat 原样透传 response_format（上游实测支持 json_object）。
+func parseResponseFormat(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	return v
 }
 
 // parseToolChoice 归一化 tool_choice：字符串或 {"type":"function","function":{"name":...}}。

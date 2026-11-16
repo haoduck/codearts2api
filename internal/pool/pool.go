@@ -10,7 +10,6 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -50,6 +49,7 @@ type Account struct {
 	activeConcurrent  int       // 当前活跃并发请求数
 	maxConcurrent     int       // 最大允许并发数
 	keepaliveLastPing time.Time // 最后保活心跳时间
+	lastUsed          time.Time // 最后一次被选中的时间（选号时按 LRU 轮转）
 	claimedCredits    float64          // 累计领取到的积分（签到/新手活动，非余额）
 	claimedCampaigns  map[int]float64 // 活动ID → 已领面额（逐活动幂等记账）
 }
@@ -79,10 +79,6 @@ type Pool struct {
 	state    string
 	mu       sync.Mutex
 	accounts []*Account
-	// pickCursor 轮转游标：顺序请求必须依次落到不同账号，否则并发为 1 时
-	// 每条请求都落在第一个账号上，把它的上游会话槽位堆满（TM.00001041 排队），
-	// 而其余账号全空着。
-	pickCursor atomic.Uint64
 }
 
 // New 构建池。
@@ -140,22 +136,45 @@ func (p *Pool) Accounts() []*Account {
 	return p.accounts
 }
 
-// AccountsRotated 返回从轮转游标开始的账号快照（每次调用游标前移一位）。
+// AccountsByLoad 返回按「并发最少 → 最久未用」排序的账号快照。
 //
-// 选号必须轮转：`Accounts()` 是固定顺序，配合「取第一个有空槽的账号」就是
-// first-fit——并发为 1 时永远选同一个账号，上游会话槽位（单账号 3 个、释放慢）
-// 被堆满后一直排队，其余账号却全空闲。
-func (p *Pool) AccountsRotated() []*Account {
+// 选号要同时满足两点：
+//   - 负载均衡：优先挑当前并发最少的账号，而不是固定顺序的 first-fit
+//     （并发为 1 时 first-fit 会把所有请求都压到第一个账号上）；
+//   - 轮转：并发相同时按「最久未被使用」（LRU）排序，顺序请求自然轮转。
+//
+// 对照 workbuddy2api-hub 的 CodeArtsPool.pick：pool.sort(key=lambda a:
+// (a.active_concurrent, a.last_used or 0))，同一思路。
+func (p *Pool) AccountsByLoad() []*Account {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	n := len(p.accounts)
-	if n == 0 {
-		return nil
+	snapshot := make([]*Account, len(p.accounts))
+	copy(snapshot, p.accounts)
+	p.mu.Unlock()
+
+	type load struct {
+		acct *Account
+		conc int
+		last time.Time
 	}
-	start := int((p.pickCursor.Add(1) - 1) % uint64(n))
-	out := make([]*Account, 0, n)
-	out = append(out, p.accounts[start:]...)
-	out = append(out, p.accounts[:start]...)
+	loads := make([]load, 0, len(snapshot))
+	for _, a := range snapshot {
+		a.mu.Lock()
+		loads = append(loads, load{acct: a, conc: a.activeConcurrent, last: a.lastUsed})
+		a.mu.Unlock()
+	}
+	sort.Slice(loads, func(i, j int) bool {
+		if loads[i].conc != loads[j].conc {
+			return loads[i].conc < loads[j].conc
+		}
+		if !loads[i].last.Equal(loads[j].last) {
+			return loads[i].last.Before(loads[j].last)
+		}
+		return loads[i].acct.Name < loads[j].acct.Name
+	})
+	out := make([]*Account, len(loads))
+	for i, l := range loads {
+		out[i] = l.acct
+	}
 	return out
 }
 
@@ -552,6 +571,7 @@ func (p *Pool) AcquireLock(name string) bool {
 			return false
 		}
 		a.activeConcurrent++
+		a.lastUsed = time.Now()
 		return true
 	}
 	return false
@@ -575,6 +595,7 @@ func (p *Pool) AcquireAnyLockWait(timeout time.Duration, skip map[string]bool) *
 			ok := !a.disabled && now.After(a.coolUntil) && a.activeConcurrent < a.maxConcurrent
 			if ok {
 				a.activeConcurrent++
+				a.lastUsed = time.Now()
 				a.keepaliveLastPing = time.Now()
 			}
 			a.mu.Unlock()
@@ -625,6 +646,7 @@ func (p *Pool) AcquireLockWait(name string, timeout time.Duration) bool {
 			a.mu.Lock()
 			if a.activeConcurrent < a.maxConcurrent {
 				a.activeConcurrent++
+				a.lastUsed = time.Now()
 				acquired = true
 			}
 			a.mu.Unlock()
@@ -860,6 +882,7 @@ func (p *Pool) Acquire(name string) bool {
 	}
 	// 增加活跃计数
 	target.activeConcurrent++
+	target.lastUsed = time.Now()
 	target.keepaliveLastPing = time.Now()
 	return true
 }
@@ -989,6 +1012,7 @@ func (p *Pool) TryAcquire(name string) bool {
 	}
 
 	target.activeConcurrent++
+	target.lastUsed = time.Now()
 	target.keepaliveLastPing = time.Now()
 	return true
 }

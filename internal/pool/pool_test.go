@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,34 +298,48 @@ func newRefreshTestPool(t *testing.T, stsURL, name string, cfg Config) *Pool {
 }
 
 
-// 选号必须轮转：并发为 1 时也不能每条请求都落在同一个账号上
-// （first-fit 会把第一个账号的上游会话槽位堆满，触发 TM.00001041 排队）。
-func TestAccountsRotatedCycles(t *testing.T) {
+// 选号：并发最少优先，并发相同按「最久未用」轮转。
+//
+// 此前是固定顺序 first-fit，并发为 1 时每条请求都落在第一个账号上，把它的
+// 上游会话槽位堆满（TM.00001041 排队），而其余账号全空闲。
+func TestAccountsByLoadPrefersLeastLoadedThenLRU(t *testing.T) {
 	mk := func(name string) *auth.Auth {
 		return auth.New(name, "user-"+name, "domain", "token", "ak", "sk",
 			time.Now().Add(time.Hour).Format(time.RFC3339), "", "")
 	}
-	p, err := New([]*auth.Auth{mk("a1"), mk("a2"), mk("a3")}, Config{MaxConcurrent: 1}, "")
+	p, err := New([]*auth.Auth{mk("a1"), mk("a2"), mk("a3")}, Config{MaxConcurrent: 2}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"a1", "a2", "a3", "a1", "a2", "a3"}
-	for i, expected := range want {
-		rot := p.AccountsRotated()
-		if len(rot) != 3 {
-			t.Fatalf("第 %d 次返回 %d 个账号，want 3", i, len(rot))
-		}
-		if rot[0].Name != expected {
-			t.Fatalf("第 %d 次首选=%s，want %s", i, rot[0].Name, expected)
-		}
-		// 轮转只改起点，不能重复或漏账号。
-		seen := map[string]int{}
-		for _, acct := range rot {
-			seen[acct.Name]++
-		}
-		if len(seen) != 3 {
-			t.Fatalf("第 %d 次轮转结果有重复/遗漏: %v", i, seen)
-		}
+	// 初始：都没用过 → 按名字稳定排序
+	order := names(p.AccountsByLoad())
+	if order != "a1,a2,a3" {
+		t.Fatalf("初始顺序=%s，want a1,a2,a3", order)
 	}
+	// 选中 a1 后，a1 变成「最近用过」→ 下次应轮到 a2
+	if !p.AcquireLock("a1") {
+		t.Fatal("acquire a1")
+	}
+	p.ReleaseLock("a1")
+	if got := p.AccountsByLoad()[0].Name; got != "a2" {
+		t.Fatalf("a1 用过之后首选=%s，want a2（LRU 轮转）", got)
+	}
+	// a1 有并发占用时，即使它是 LRU 也要让位给并发更少的账号
+	if !p.AcquireLock("a1") || !p.AcquireLock("a1") {
+		t.Fatal("acquire a1 x2")
+	}
+	if got := p.AccountsByLoad()[0].Name; got == "a1" {
+		t.Fatalf("a1 已满 2 并发，不应再排第一")
+	}
+	p.ReleaseLock("a1")
+	p.ReleaseLock("a1")
+}
+
+func names(accts []*Account) string {
+	out := make([]string, 0, len(accts))
+	for _, a := range accts {
+		out = append(out, a.Name)
+	}
+	return strings.Join(out, ",")
 }
 

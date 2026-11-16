@@ -371,3 +371,69 @@ func TestConversationIDForIgnoresEmptyUserMessages(t *testing.T) {
 	}
 }
 
+
+// stop 兼容 string / []string；空值不传。
+func TestParseStopShapes(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{`"STOP"`, "STOP"},
+		{`["a","b"]`, "a,b"},
+		{`["a",""]`, "a"},
+		{`null`, ""},
+		{``, ""},
+		{`123`, ""},
+	}
+	for _, c := range cases {
+		var raw json.RawMessage
+		if c.raw != "" {
+			raw = json.RawMessage(c.raw)
+		}
+		if got := strings.Join(parseStop(raw), ","); got != c.want {
+			t.Fatalf("parseStop(%s)=%q want %q", c.raw, got, c.want)
+		}
+	}
+}
+
+// 采样/格式类参数要解析进 chatRequest（再透传给上游）。
+func TestParseChatRequestKeepsSamplingFields(t *testing.T) {
+	req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":"hi"}],
+		"stop":"END","frequency_penalty":0.5,"presence_penalty":0.25,"seed":7,
+		"top_k":20,"parallel_tool_calls":false,"response_format":{"type":"json_object"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Stop) != 1 || req.Stop[0] != "END" {
+		t.Fatalf("Stop=%v", req.Stop)
+	}
+	if req.FrequencyPenalty == nil || *req.FrequencyPenalty != 0.5 {
+		t.Fatalf("FrequencyPenalty=%v", req.FrequencyPenalty)
+	}
+	if req.PresencePenalty == nil || *req.PresencePenalty != 0.25 {
+		t.Fatalf("PresencePenalty=%v", req.PresencePenalty)
+	}
+	if req.Seed == nil || *req.Seed != 7 {
+		t.Fatalf("Seed=%v", req.Seed)
+	}
+	if req.TopK == nil || *req.TopK != 20 {
+		t.Fatalf("TopK=%v", req.TopK)
+	}
+	if req.ParallelToolCalls == nil || *req.ParallelToolCalls {
+		t.Fatalf("ParallelToolCalls=%v", req.ParallelToolCalls)
+	}
+	rf, _ := req.ResponseFormat.(map[string]any)
+	if rf["type"] != "json_object" {
+		t.Fatalf("ResponseFormat=%#v", req.ResponseFormat)
+	}
+}
+
+// 未提供时保持零值（不凭空塞值给上游）。
+func TestParseChatRequestOmitsSamplingFields(t *testing.T) {
+	req, err := parseChatRequest([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Stop) != 0 || req.FrequencyPenalty != nil || req.PresencePenalty != nil ||
+		req.Seed != nil || req.TopK != nil || req.ParallelToolCalls != nil || req.ResponseFormat != nil {
+		t.Fatalf("未提供的采样参数不应有值: %+v", req)
+	}
+}
+

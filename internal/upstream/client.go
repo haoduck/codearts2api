@@ -429,6 +429,18 @@ type ChatOptions struct {
 	TopP            *float64
 	Tools           []map[string]any
 	ToolChoice      any
+	// OTSessionID 账号级稳定会话 id（见 OTSessionIDFor）：让网关按「每账号一个
+	// 会话」计数，而不是每个请求一个，避免自己把自己的并发会话名额占满。
+	OTSessionID string
+
+	// 以下字段上游实测接受并生效（此前被网关静默丢弃）。
+	Stop              []string
+	FrequencyPenalty  *float64
+	PresencePenalty   *float64
+	Seed              *int
+	ResponseFormat    any
+	TopK              *int
+	ParallelToolCalls *bool
 }
 
 // CanonicalModel 把用户友好模型 ID 映射为上游 InferHub 注册的模型 ID。
@@ -490,7 +502,7 @@ func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatM
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
 func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
 	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit)
+	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), opts.OTSessionID, benefit)
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
@@ -526,6 +538,29 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 		if opts.ToolChoice != nil {
 			body["tool_choice"] = opts.ToolChoice
 		}
+	}
+	// 以下字段上游实测接受并生效（对照 workbuddy2api-hub 的 build_chat_body，
+	// 其注释记录为 "Verified against the CodeArts upstream"）；此前网关静默丢弃。
+	if len(opts.Stop) > 0 {
+		body["stop"] = opts.Stop
+	}
+	if opts.FrequencyPenalty != nil {
+		body["frequency_penalty"] = *opts.FrequencyPenalty
+	}
+	if opts.PresencePenalty != nil {
+		body["presence_penalty"] = *opts.PresencePenalty
+	}
+	if opts.Seed != nil {
+		body["seed"] = *opts.Seed
+	}
+	if opts.ResponseFormat != nil {
+		body["response_format"] = opts.ResponseFormat
+	}
+	if opts.TopK != nil {
+		body["top_k"] = *opts.TopK
+	}
+	if opts.ParallelToolCalls != nil {
+		body["parallel_tool_calls"] = *opts.ParallelToolCalls
 	}
 	return body
 }
@@ -592,14 +627,15 @@ func sessionIDFor(chatID string) string {
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
 // 计入 SignedHeaders。
 func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
-	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
+	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", "", benefit)
 }
 
 // sendChatV2 发送聊天请求并返回 SSE 流。
 //
 // chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
+// otSessionID 是账号级稳定会话 id，让网关按「每账号一个会话」统计并发（见 OTSessionIDFor）。
 // benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
-func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID, otSessionID string, benefit bool) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
 	if err != nil {
@@ -617,6 +653,14 @@ func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID st
 	}
 	if sessionID != "" {
 		httpReq.Header.Set("Session-Id", sessionID)
+	}
+	// 会话统计头：网关按 x-ot-session-id 统计每账号并发会话，不发就等于每个
+	// 请求一个新会话（结束后还占位约 60 秒），单账号 3 个名额很快被占满。
+	// 三个头都在签名之后追加，不进入 SignedHeaders。
+	if otSessionID != "" {
+		httpReq.Header.Set("x-ot-session-id", otSessionID)
+		httpReq.Header.Set("user-session-id", otSessionID)
+		httpReq.Header.Set("x-ot-trace-id", randomHexLower(16))
 	}
 	resp, err := c.streamHTTP.Do(httpReq)
 	if err != nil {

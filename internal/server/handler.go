@@ -646,8 +646,9 @@ func (h *Handler) pickByCatalog(tried map[string]bool, wantLower string) *pool.A
 // 返回 nil 表示所有账号要么不健康、要么槽位都满了。
 func (h *Handler) acquireSlot(skip map[string]bool, model string) *pool.Account {
 	want := strings.ToLower(upstream.CanonicalModel(model))
-	// 轮转顺序：并发为 1 时也不能总选同一个账号（见 Pool.AccountsRotated）。
-	for _, acct := range h.cfg.Pool.AccountsRotated() {
+	// 「并发最少 → 最久未用」排序：既做负载均衡，又让顺序请求自然轮转
+	// （见 Pool.AccountsByLoad）。
+	for _, acct := range h.cfg.Pool.AccountsByLoad() {
 		if acct == nil || skip[acct.Name] || !h.cfg.Pool.Healthy(acct.Name) {
 			continue
 		}
@@ -868,6 +869,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			TopP:            req.TopP,
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
+			// 账号级稳定会话 id：让网关按「每账号一个会话」统计并发。
+			OTSessionID: upstream.OTSessionIDFor(acct.UID),
+
+			Stop:              req.Stop,
+			FrequencyPenalty:  req.FrequencyPenalty,
+			PresencePenalty:   req.PresencePenalty,
+			Seed:              req.Seed,
+			ResponseFormat:    req.ResponseFormat,
+			TopK:              req.TopK,
+			ParallelToolCalls: req.ParallelToolCalls,
 		}
 		// 上游并发会话/TPM 排队是瞬时的。先尝试换号（每个账号的上游会话
 		// 槽位是独立的，别的账号空闲时换过去立刻能跑），没有别的账号可用时
@@ -915,6 +926,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						cred = credentialOf(acct)
 						// 限时福利路由按账号判定，换号后要重新算。
 						benefit = upstream.IsBenefitModel(acct.UID, model)
+						// 会话统计头也按账号派生，换号后必须跟着换。
+						chatOpts.OTSessionID = upstream.OTSessionIDFor(acct.UID)
 						noteTraffic(acct.UID)
 						continue
 					}
@@ -1319,9 +1332,16 @@ func isParamInvalidError(err error) bool {
 }
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。
+//
+// 上游的错误文案不统一：中文「并发会话数已达上限」、错误码 TM.00001041，
+// 英文变体 "concurrent session" / "maximum number of active"（对照
+// workbuddy2api-hub 的 _is_concurrency_message）。
 func isConcurrentLimitError(msg string) bool {
 	low := strings.ToLower(msg)
-	return strings.Contains(low, "tm.00001041") || strings.Contains(low, "并发会话")
+	return strings.Contains(low, "tm.00001041") ||
+		strings.Contains(low, "并发会话") ||
+		strings.Contains(low, "concurrent session") ||
+		strings.Contains(low, "maximum number of active")
 }
 
 func isQueueLimitError(err *upstream.ApiError) bool {

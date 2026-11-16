@@ -234,6 +234,7 @@ arm64 不需要 QEMU 模拟编译，只有最终 alpine 阶段的 `apk` 走模�
 | `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
 | `CA2A_MAX_CONCURRENT` | 单账号最大并发数（上游单账号只有 3 个并发会话且释放慢，建议 2~3；设 1 时一个请求排队会阻塞整号） | `1` |
 | `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
+| `CA2A_OT_SESSION` | 发送账号级会话统计头 `x-ot-session-id`：网关按它统计「每账号并发会话」，关掉则每个请求算一个新会话（结束后仍占位约 60 秒），单账号 3 个名额很快被占满（实测 6 条请求撞 3 次 TM.00001041，开启后 0 次）。设 `0` 可退回旧行为做对照 | `1` |
 | `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
 | `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
 | `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |

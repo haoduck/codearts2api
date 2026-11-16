@@ -1,6 +1,11 @@
 package upstream
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"strings"
+)
 
 // IsSessionBrokenError 判断是否为「上游会话历史损坏」类错误。
 //
@@ -26,3 +31,30 @@ func IsSessionBrokenError(err error) bool {
 	}
 	return false
 }
+
+// OTSessionEnabled 默认开启；设 CA2A_OT_SESSION=0 可退回旧行为（便于对照）。
+func OTSessionEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CA2A_OT_SESSION"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// OTSessionIDFor 返回**账号级稳定**的会话 id（同一账号永远同一个，重启/续期不变）。
+//
+// 网关按 x-ot-session-id 统计「每账号的并发会话数」：
+//   - 不发这个头时，每个请求都算一个新会话，会话结束后还要占位约 60 秒，
+//     单账号 3 个名额很快被自己的历史请求占满 → TM.00001041 排队；
+//   - Chat-Id / Session-Id 不参与这个计数。
+//
+// 因此这里给每个账号一个固定值，让网关把同一账号的所有请求算作同一个会话。
+// 该头必须在**签名之后**追加（不进入 SignedHeaders）。
+func OTSessionIDFor(accountUID string) string {
+	if !OTSessionEnabled() || accountUID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("codearts-ot-session:" + accountUID))
+	return hex.EncodeToString(sum[:16])
+}
+
