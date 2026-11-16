@@ -3,6 +3,7 @@ package server
 
 import (
 	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -110,6 +111,8 @@ type Handler struct {
 	chats  map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
 	convAcct map[string]string
+	// 会话代数：某会话的上游历史文件损坏时 +1，让后续请求自动换一个全新 chat_id。
+	convGen map[string]uint64
 	// usage 代理侧 token 用量统计（按 天×账号×模型 聚合）。
 	usage *usageStore
 
@@ -165,6 +168,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
 		convAcct: map[string]string{},
+		convGen:  map[string]uint64{},
 		usage:    newUsageStore(cfg.UsageFile),
 	}
 	h.loadChats()
@@ -711,6 +715,42 @@ func credentialOf(acct *pool.Account) upstream.SignCredential {
 	return upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token}
 }
 
+// scopedChatID 把「会话 + 账号 + 代数」派生为上游要求的 32 位十六进制 chat_id。
+//
+// 账号参与派生是关键：上游的会话历史是按 chat_id 存的服务端文件，同一 chat_id
+// 在多个账号间漂移会留下互不一致的历史文件（HISTORY_LOAD_FAILED）。
+func scopedChatID(conversationID, account string, gen uint64) string {
+	if conversationID == "" {
+		return randHex(32)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", conversationID, account, gen)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// sessionGeneration 返回该会话当前的代数（0 表示历史正常）。
+func (h *Handler) sessionGeneration(conversationID string) uint64 {
+	if conversationID == "" {
+		return 0
+	}
+	h.convMu.Lock()
+	defer h.convMu.Unlock()
+	return h.convGen[conversationID]
+}
+
+// bumpSessionGeneration 让该会话换一个新的 chat_id（上游历史文件损坏时用）。
+func (h *Handler) bumpSessionGeneration(conversationID string) uint64 {
+	if conversationID == "" {
+		return 0
+	}
+	h.convMu.Lock()
+	defer h.convMu.Unlock()
+	if h.convGen == nil {
+		h.convGen = map[string]uint64{}
+	}
+	h.convGen[conversationID]++
+	return h.convGen[conversationID]
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
@@ -810,11 +850,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Pool.PingKeepalive(acct.Name)
 		}
 
-		chatID := req.ConversationID
-		// 上游要求 chat_id 为 32 位十六进制（UUID 去连字符）；无显式 id 时每次新建。
-		if !validChatID(chatID) {
-			chatID = randHex(32)
-		}
+		// chat_id 必须按「账号 + 会话代数」隔离。
+		//
+		// 上游把会话历史按 chat_id 存成服务端文件；此前 chat_id 只由首条消息
+		// 派生，账号轮转后同一个 chat_id 会在多个账号上各留一份互相不一致的
+		// 历史（你带上完整历史重放到某个账号，它的那份却停在更早的轮次），
+		// 于是时不时报 HISTORY_LOAD_FAILED「历史文件存在异常，请新建任务」。
+		// 按账号隔离后，每个账号各自维护自己那份一致的历史。
+		// 万一还是坏了：bumpSessionGeneration 会让代数 +1 → 换全新会话。
+		chatID := scopedChatID(req.ConversationID, acct.Name, h.sessionGeneration(req.ConversationID))
 
 		cred := credentialOf(acct)
 		chatOpts := upstream.ChatOptions{
@@ -905,6 +949,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = serr
+			if upstream.IsSessionBrokenError(serr) {
+				// 会话历史坏了：换新会话重试（chatID 按代数派生，下轮自动变新）。
+				// 账号本身是健康的，所以要从 tried 里放回去，否则外层轮转
+				// 会把这个账号当「已试过」跳过（单账号池直接 503）。
+				gen := h.bumpSessionGeneration(req.ConversationID)
+				delete(tried, acct.Name)
+				log.Printf("upstream session broken account=%s chat=%s → 换新会话重试 (gen=%d): %v",
+					acct.Name, shortID(chatID), gen, serr)
+				continue
+			}
 			if h.handleUpstreamError(acct, model, serr) {
 				// 模型级错误：换账号也是同样结果，直接给客户端明确答复。
 				writeOpenAIError(w, http.StatusNotFound, "model_not_available",
@@ -944,9 +998,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
-				log.Printf("chat stream account=%s error: %v", acct.Name, werr)
-				if !isParamInvalidError(werr) {
-					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+				if upstream.IsSessionBrokenError(werr) {
+					// 会话级故障：不记账号错误、不冷却（账号是健康的），
+					// 只把会话代数 +1，客户端下一次请求自动落到全新会话。
+					gen := h.bumpSessionGeneration(req.ConversationID)
+					log.Printf("upstream session broken account=%s chat=%s → 下次换新会话 (gen=%d): %v",
+						acct.Name, shortID(chatID), gen, werr)
+				} else {
+					log.Printf("chat stream account=%s error: %v", acct.Name, werr)
+					if !isParamInvalidError(werr) {
+						h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					}
 				}
 			} else {
 				h.cfg.Pool.NoteSuccess(acct.Name)
@@ -962,6 +1024,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
 				return
+			}
+			if upstream.IsSessionBrokenError(aerr) {
+				// 会话历史坏了：换新会话重试（chatID 按代数派生，下轮自动变新），
+				// 且不冷却账号——这不是账号的错。账号放回 tried，允许重新选中。
+				gen := h.bumpSessionGeneration(req.ConversationID)
+				delete(tried, acct.Name)
+				log.Printf("upstream session broken account=%s chat=%s → 换新会话重试 (gen=%d): %v",
+					acct.Name, shortID(chatID), gen, aerr)
+				lastErr = aerr
+				continue
 			}
 			lastErr = aerr
 			h.cfg.Pool.Cooldown(acct.Name, pool.CoolErr, h.cfg.ErrCooldown, aerr.Error())
@@ -1187,6 +1259,11 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 // 轮转并向客户端返回明确错误（换账号也是同样的结果）。
 func (h *Handler) handleUpstreamError(acct *pool.Account, model string, err error) bool {
 	if isParamInvalidError(err) {
+		return false
+	}
+	if upstream.IsSessionBrokenError(err) {
+		// 会话级故障（上游历史文件坏了）：与账号健康无关，不记错误也不冷却。
+		// 调用方会换新会话重试。
 		return false
 	}
 	var ae *upstream.ApiError
